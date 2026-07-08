@@ -1,0 +1,85 @@
+[project]
+name = "gps_api"
+version = "0.1.0"
+description = "Read-only FastAPI service serving precomputed GNSS analysis products (series, velocities, deformation models) for the IMO network"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Benedikt Gunnar Ófeigsson", email = "bgo@vedur.is" }]
+maintainers = [{ name = "Benedikt Gunnar Ófeigsson", email = "bgo@vedur.is" }]
+keywords = ["gps", "gnss", "geodesy", "fastapi", "geojson", "deformation", "api"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Typing :: Typed",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+    "uvicorn>=0.32",
+]
+
+# Repo home: git.vedur.is (GitLab — services live there per plan §3; exact
+# group TBD with the aut/ut-dev web/infra team).
+
+[project.scripts]
+gps-api = "gps_api.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gps_api"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "httpx2",  # starlette ≥0.5x TestClient backend (plain httpx is deprecated there)
+    "ruff>=0.8",
+    "black>=24.10",
+    "mypy>=1.13",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "N",  # pep8-naming
+    "UP", # pyupgrade
+    "B",  # flake8-bugbear
+]
+ignore = [
+    "E501", # line length handled by black
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py313"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true

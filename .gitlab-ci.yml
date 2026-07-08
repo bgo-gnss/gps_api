@@ -1,0 +1,28 @@
+# gps_api — quality pipeline (self-contained).
+#
+# When this repo is created on git.vedur.is, consider switching to the org CI
+# templates the way aflogun does:
+#   include:
+#     - project: 'aut/ut-dev/infrastructure'
+#       ref: main
+#       file: 'templates/ci/web/web.yml'   # (a Python-service template, if one exists)
+
+stages:
+  - quality
+
+variables:
+  UV_CACHE_DIR: .cache/uv
+
+quality:
+  stage: quality
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  script:
+    - uv sync --all-groups
+    - uv run ruff check src tests
+    - uv run black --check src tests
+    - uv run mypy src tests
+    - uv run pytest --cov=gps_api --cov-report=term-missing
+  cache:
+    key: "$CI_JOB_NAME"
+    paths:
+      - .cache/uv
