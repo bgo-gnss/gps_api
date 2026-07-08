@@ -10,12 +10,15 @@ Consumers: thin Dash QC tool (Phase 1), aflogun SPA (Phase 4), gps_plot.
 
 ## Contract
 
-- `docs/API_CONTRACT.md` is the reviewable contract v0; `src/gps_api/schemas.py`
-  is the typed source of truth for shapes. Change them **together**.
+- `docs/API_CONTRACT.md` is the contract (v0, **reviewed 2026-07-08** — its
+  Decisions section is binding); `src/gps_api/schemas.py` is the typed source
+  of truth for shapes. Change them **together**.
 - Non-negotiables: GeoJSON FeatureCollections for anything mappable; UTC
   ISO-8601 `Z`; explicit unit fields (mm, mm/yr); `{"detail": …}` errors;
-  `/stations` (cacheable catalog) split from `/stations/{marker}/series`
-  (on-demand); complex selections via `POST /query`; typed versioned `/layers`.
+  `/v1/stations` (cacheable catalog) split from `/v1/stations/{marker}/series`
+  (on-demand, `max_points`/LTTB); complex selections via `POST /v1/query`;
+  typed versioned `/v1/layers`. Data endpoints live under `/v1` (`/healthz`
+  unversioned); fully public read, no auth, QC products stay out.
 - All data endpoints are **501 stubs** until Phase 1 wires the store — keep
   the `not_implemented()` helper pattern so error shape stays uniform.
 

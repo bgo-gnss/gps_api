@@ -4,8 +4,9 @@ Read-only service over the precomputed analysis store (Postgres for
 metadata/velocities/catalogs; Parquet/GeoJSON files for bulk series and
 rasters). The scheduled precompute job writes; this API only reads.
 
-Contract: ``docs/API_CONTRACT.md`` (v0). All data endpoints are 501 stubs
-until Phase 1 wires the store.
+Contract: ``docs/API_CONTRACT.md`` (v0, reviewed 2026-07-08). Data endpoints
+mount under ``/v1``; ``/healthz`` stays unversioned. All data endpoints are
+501 stubs until Phase 1 wires the store.
 """
 
 from fastapi import FastAPI
@@ -21,11 +22,14 @@ def create_app() -> FastAPI:
         summary="Read-only API over precomputed GNSS analysis products (IMO)",
         version=__version__,
     )
-    app.include_router(stations.router)
-    app.include_router(velocities.router)
-    app.include_router(models.router)
-    app.include_router(layers.router)
-    app.include_router(query.router)
+    for router in (
+        stations.router,
+        velocities.router,
+        models.router,
+        layers.router,
+        query.router,
+    ):
+        app.include_router(router, prefix="/v1")
 
     @app.get("/healthz", tags=["service"])
     def healthz() -> dict[str, str]:

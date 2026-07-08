@@ -112,6 +112,26 @@ class ModelResult(BaseModel):
     )
 
 
+class ModelFit(BaseModel):
+    """One historical fit in a region's model time-lapse."""
+
+    fitted_at: datetime
+    parameters: dict[str, float]
+    provenance: str | None = None
+
+
+class ModelHistory(BaseModel):
+    """GET /models/{region}/history — fit time series (e.g. Svartsengi volume).
+
+    Reserved in v0, wired in Phase 2 alongside the Mogi inversion lane and
+    the reconciliation against Vincent's ``inv_volume_mogi.dat``.
+    """
+
+    region: str
+    kind: Literal["mogi"]
+    fits: list[ModelFit]
+
+
 class Layer(BaseModel):
     """One entry in the typed, versioned layer catalog (data-driven overlays)."""
 

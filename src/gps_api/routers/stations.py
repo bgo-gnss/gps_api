@@ -27,8 +27,15 @@ def station_series(
     marker: str,
     start: datetime | None = None,
     end: datetime | None = None,
-    downsample: Annotated[
-        int | None, Query(ge=1, description="keep every Nth sample")
+    max_points: Annotated[
+        int | None,
+        Query(
+            ge=2,
+            description=(
+                "target point count; the server downsamples visually "
+                "faithfully (LTTB — peaks, offsets and trend shape survive)"
+            ),
+        ),
     ] = None,
     detrended: bool = True,
 ) -> SeriesResponse:
