@@ -28,6 +28,15 @@ SERIES_DIR = "series"
 MODELS_DIR = "models"
 META_DIR = "meta"
 
+#: Store file names (shared vocabulary of writer and readers).
+STATIONS_FILE = "stations.geojson"
+RUN_META_FILE = "run.json"
+
+#: Parquet schema-metadata key carrying product provenance. Lives here (not
+#: in ``precompute.products``) so the series router can read it without
+#: importing the precompute package (which pulls in ``gps_analysis``).
+PROVENANCE_METADATA_KEY = b"gps_api_provenance"
+
 
 def store_path() -> Path:
     """Resolve the product-store root directory (see module docstring)."""

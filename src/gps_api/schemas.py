@@ -11,7 +11,7 @@ Conventions (skjalftalisa lessons, plan §10.5):
 """
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -78,7 +78,15 @@ class VelocityProperties(BaseModel):
     sigma_up: float
     magnitude: float = Field(description="horizontal speed, mm/yr")
     azimuth: float = Field(description="degrees clockwise from north")
-    method: Literal["wls", "mle"]
+    method: Literal["wls", "gbis", "mle"] = Field(
+        description=(
+            "estimator tag (PLAN-analysis-lane §1): 'wls' = fixed-window "
+            "weighted least squares with formal σ (the fleet baseline); "
+            "'gbis' = GBIS4TS joint break/colored-noise estimate with "
+            "honest σ (selective, per breakpoints.enabled_regions); "
+            "'mle' reserved"
+        )
+    )
     window_start: datetime
     window_end: datetime
 
@@ -96,19 +104,76 @@ class VelocityCollection(BaseModel):
     features: list[VelocityFeature]
 
 
-class ModelResult(BaseModel):
-    """GET /models/{region} — latest deformation-source model for a region."""
+class BreakEntry(BaseModel):
+    """One GBIS4TS break/rate-change estimate (one station, one component).
 
-    region: str
-    kind: Literal["mogi"] = Field(
-        description="source type; 'okada' and 'joint' arrive in Phase 2"
+    Mirrors losslessly what the precompute writer emits into
+    ``models/<region>_breaks.json``
+    (:func:`gps_api.precompute.products.write_breaks_json`); the parameter
+    names follow the BPD1/BPD2 flattening in
+    :func:`gps_api.precompute.job._break_parameters` — intercept [mm],
+    secular trend [mm/yr], rate change(s) [mm/yr], break epoch(s)
+    [fractional yr], colored-noise spectral index κ and amplitude [mm]
+    (Yang, Sigmundsson & Geirsson 2023, 2023GL103432).
+    """
+
+    marker: str
+    component: Literal["north", "east", "up"]
+    model: Literal["BPD1", "BPD2"] = Field(
+        description="GBIS4TS forward model: one or two velocity break points"
+    )
+    method: Literal["gbis"] = "gbis"
+    fitted_at: datetime
+    breakpoint_time: datetime = Field(
+        description="first break epoch as UTC time (breakpoint_yearf converted)"
     )
     parameters: dict[str, float] = Field(
-        description="named source parameters (lon, lat, depth_km, dV_m3, ...)"
+        description=(
+            "posterior-optimal parameters: intercept_mm, trend_mm_yr, "
+            "trend_change_mm_yr, breakpoint_yearf (+ trend_change2_mm_yr, "
+            "breakpoint2_yearf for BPD2), kappa, amp_mm"
+        )
+    )
+    wn_amp_mm: float = Field(description="fixed white-noise amplitude used, mm")
+    y_ref_mm: float = Field(
+        description="start baseline subtracted by the zero-reference conditioning, mm"
+    )
+    n_runs: int = Field(description="kept MCMC iterations behind the estimate")
+
+
+class ModelResult(BaseModel):
+    """GET /models/{region} — latest model products for a region.
+
+    Two kinds share the endpoint: ``'mogi'`` (deformation-source inversion —
+    reserved, backburnered lane) carries ``parameters``; ``'breakpoints'``
+    (GBIS4TS break/rate-change catalog, analysis lane) carries ``entries``
+    (one per station × component).
+    """
+
+    region: str
+    kind: Literal["mogi", "breakpoints"] = Field(
+        description=(
+            "'breakpoints' = GBIS4TS break/rate-change catalog (entries); "
+            "'mogi' = deformation-source parameters (reserved); 'okada' "
+            "and 'joint' arrive with the modeling lane"
+        )
+    )
+    parameters: dict[str, float] = Field(
+        default_factory=dict,
+        description="named source parameters (lon, lat, depth_km, dV_m3, ...);"
+        " empty for kind='breakpoints'",
+    )
+    entries: list[BreakEntry] | None = Field(
+        default=None,
+        description="break/rate-change estimates (kind='breakpoints' only)",
     )
     fitted_at: datetime
-    provenance: str | None = Field(
-        default=None, description="pipeline version / input window used for the fit"
+    provenance: str | dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "product provenance: method tag, frame, software versions, "
+            "fitted_at, input source (structured), or a free-form note"
+        ),
     )
 
 
@@ -117,7 +182,7 @@ class ModelFit(BaseModel):
 
     fitted_at: datetime
     parameters: dict[str, float]
-    provenance: str | None = None
+    provenance: str | dict[str, Any] | None = None
 
 
 class ModelHistory(BaseModel):
@@ -128,7 +193,7 @@ class ModelHistory(BaseModel):
     """
 
     region: str
-    kind: Literal["mogi"]
+    kind: Literal["mogi", "breakpoints"]
     fits: list[ModelFit]
 
 

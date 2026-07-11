@@ -19,9 +19,14 @@ Consumers: thin Dash QC tool (Phase 1), aflogun SPA (Phase 4), gps_plot.
   (on-demand, `max_points`/LTTB); complex selections via `POST /v1/query`;
   typed versioned `/v1/layers`. Data endpoints live under `/v1` (`/healthz`
   unversioned); fully public read, no auth, QC products stay out.
-- **`GET /v1/velocities` is store-wired** (Phase-1 slice, 2026-07-11); the
-  other data endpoints stay **501 stubs** — keep the `not_implemented()`
-  helper pattern so error shape stays uniform.
+- **Store-wired** (fleet slice, 2026-07-11): `/v1/stations`,
+  `/v1/stations/{marker}/series` (LTTB via `downsample.py`; `api.max_points`
+  from the run meta is default + clamp — contract Amendment A3),
+  `/v1/velocities`, `/v1/models/{region}` (`kind="breakpoints"`, GBIS4TS).
+  Still **501 stubs**: `/models/{region}/history` (reserved, Decisions #5),
+  `/layers`, `/query` — keep the `not_implemented()` helper pattern so
+  error shape stays uniform. `method` values: `wls | gbis` (`mle` reserved);
+  see the contract's Amendments A1–A4.
 
 ## Precompute job (decision: lives here, `gps_api.precompute`)
 
@@ -38,24 +43,36 @@ zero hardcoded paths/stations. Store root: `$GPS_API_STORE` →
 `schemas.py` before writing; every product carries provenance (method,
 frame, software versions, `fitted_at`, source). The API routers still never
 import `gps_analysis`/`gps_parser` — only `gps_api.precompute` does (deps in
-the `precompute` dependency group; editable sibling paths via
-`[tool.uv.sources]`, so GitLab CI needs the git-dep switch once the
-analysis-lane branch merges/publishes).
+the `precompute` dependency group; the API runtime reads the store with
+numpy/pyarrow only; editable sibling paths via `[tool.uv.sources]`, so
+GitLab CI needs the git-dep switch once the analysis-lane branch
+merges/publishes).
+
+**Fleet runs** (`run_fleet` / `--fleet`, Phase-2 rollout): every region in
+`cfg.regions` through the same per-region chain into ONE coherent store —
+combined `stations.geojson` (multi-region membership merged), per-region
+velocity/break products, one fleet `meta/run.json` (per-region +
+per-station success/failure counts). Fault tolerance at both levels: a bad
+station is skipped inside its region, a bad region is skipped by the fleet.
+GBIS4TS stays gated by `breakpoints.enabled_regions` — WLS is the
+fleet-wide baseline; never run the 1e6 chains across all stations.
 
 ## Layout & commands
 
 ```
-src/gps_api/{main.py, schemas.py, settings.py,
+src/gps_api/{main.py, schemas.py, settings.py, downsample.py,
              routers/{stations,velocities,models,layers,query}.py,
              precompute/{config,sources,products,job}.py}
-tests/test_app.py         # contract-shape tests (routes, 501+detail, OpenAPI)
-tests/test_precompute.py  # end-to-end: config → precompute → store → /v1/velocities
+tests/test_app.py         # contract-shape tests (routes, 404/501+detail, OpenAPI)
+tests/test_precompute.py  # end-to-end: config → precompute (region + fleet) → store → wired endpoints
+tests/test_downsample.py  # LTTB property tests + single-channel reference parity
 ```
 
 ```bash
 uv sync --all-groups && uv run gps-api    # dev server :8000, docs at /docs
 uv run gps-api-precompute --synthetic --runs 2000  # foreground batch (dev chain)
-uv run gps-api-precompute --neu-dir <dir>          # real .NEU products
+uv run gps-api-precompute --neu-dir <dir>          # real .NEU products, one region
+uv run gps-api-precompute --fleet --neu-dir <dir>  # all configured regions, one store
 uv run ruff check src tests && uv run black --check src tests
 uv run mypy src tests && uv run pytest
 ```
@@ -70,4 +87,5 @@ uv run mypy src tests && uv run pytest
   those imports are allowed.
 
 ---
-*Last reviewed: 2026-07-11 (Phase-1 slice: precompute module + wired /v1/velocities)*
+*Last reviewed: 2026-07-11 (fleet rollout: `run_fleet`/`--fleet`, wired
+stations/series/models endpoints, LTTB, contract Amendments A1–A4)*

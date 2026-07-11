@@ -21,11 +21,10 @@ Contract mapping (``docs/API_CONTRACT.md`` / :mod:`gps_api.schemas`):
   timestamps, displacement columns are mm, ``*_detrended`` carries the
   trajectory-model residuals. Provenance travels in the Parquet schema
   metadata (key ``gps_api_provenance``).
-- ``models/*_breaks.json`` entries mirror :class:`~gps_api.schemas.ModelFit`
-  (``fitted_at`` + ``parameters`` + provenance); serving them under
-  ``/v1/models`` with a ``method="gbis"`` kind is the next slice (the v0
-  schema literal only knows ``"mogi"`` — contract change, handled together
-  with ``schemas.py``).
+- ``models/*_breaks.json`` is served by ``GET /v1/models/{region}`` as a
+  :class:`~gps_api.schemas.ModelResult` with ``kind="breakpoints"``; each
+  entry validates as a :class:`~gps_api.schemas.BreakEntry` (schema named
+  after the ``kind`` this writer emits, so the file round-trips losslessly).
 
 Every product carries provenance: estimation method, reference frame,
 software versions, ``fitted_at`` (UTC), input source.
@@ -47,7 +46,10 @@ from gps_api import __version__, settings
 from gps_api.precompute.sources import COMPONENTS, FloatArray, StationSeries
 from gps_api.schemas import StationCollection, VelocityCollection
 
-PROVENANCE_METADATA_KEY = b"gps_api_provenance"
+# Re-exported from settings (the shared writer/reader vocabulary) so the
+# series router can read it without importing this gps_analysis-dependent
+# module; kept here as the historical import location.
+PROVENANCE_METADATA_KEY = settings.PROVENANCE_METADATA_KEY
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,7 +109,7 @@ def write_stations_geojson(
     """Write the station catalog (validated ``StationCollection``)."""
     payload = catalog.model_dump(mode="json")
     payload["provenance"] = provenance.as_dict()
-    return _write_json(store / "stations.geojson", payload)
+    return _write_json(store / settings.STATIONS_FILE, payload)
 
 
 def write_velocities_geojson(
@@ -176,4 +178,4 @@ def write_breaks_json(
 
 def write_run_meta(store: Path, summary: dict[str, Any]) -> Path:
     """Write the run-level provenance summary (``meta/run.json``)."""
-    return _write_json(store / settings.META_DIR / "run.json", summary)
+    return _write_json(store / settings.META_DIR / settings.RUN_META_FILE, summary)

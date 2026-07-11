@@ -5,8 +5,10 @@ This package is the *writer* half of gps_api: a batch job that runs the
 products to the file store the read-only API serves
 (:mod:`gps_api.settings` resolves the store root for both sides).
 
-Phase-1 vertical slice — one region, file store only (Parquet/GeoJSON/JSON;
-Postgres is the next slice):
+File store only for now (Parquet/GeoJSON/JSON; Postgres is a later slice).
+Two run shapes: one region (:func:`run_precompute`, the Phase-1 slice) or
+the whole configured fleet (:func:`run_fleet`, Phase-2 rollout — combined
+station catalog, per-region products, one fleet ``meta/run.json``):
 
 - :mod:`gps_api.precompute.config` — all regions, stations, windows and
   paths come from the deployed gpsconfig via ``gps_parser`` (zero
@@ -24,6 +26,12 @@ The API routers never import this package (or ``gps_analysis``) — they only
 read the files it writes.
 """
 
-from gps_api.precompute.job import main, run_precompute
+from gps_api.precompute.job import (
+    FleetSummary,
+    RunSummary,
+    main,
+    run_fleet,
+    run_precompute,
+)
 
-__all__ = ["main", "run_precompute"]
+__all__ = ["FleetSummary", "RunSummary", "main", "run_fleet", "run_precompute"]

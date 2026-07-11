@@ -5,8 +5,10 @@ metadata/velocities/catalogs; Parquet/GeoJSON files for bulk series and
 rasters). The scheduled precompute job writes; this API only reads.
 
 Contract: ``docs/API_CONTRACT.md`` (v0, reviewed 2026-07-08). Data endpoints
-mount under ``/v1``; ``/healthz`` stays unversioned. All data endpoints are
-501 stubs until Phase 1 wires the store.
+mount under ``/v1``; ``/healthz`` stays unversioned. Store-wired:
+``/v1/stations``, ``/v1/stations/{marker}/series``, ``/v1/velocities``,
+``/v1/models/{region}``. Still 501: ``/v1/models/{region}/history``
+(reserved, contract Decisions #5), ``/v1/layers``, ``/v1/query``.
 """
 
 from fastapi import FastAPI

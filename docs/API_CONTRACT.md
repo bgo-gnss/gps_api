@@ -44,16 +44,16 @@
 
 ## Endpoints (v0 surface)
 
-| Method | Path | Returns | Notes |
-|---|---|---|---|
-| GET | `/healthz` | `{"status","version"}` | liveness probe (unversioned) |
-| GET | `/v1/stations` | `StationCollection` (GeoJSON) | cacheable catalog |
-| GET | `/v1/stations/{marker}/series` | `SeriesResponse` | `start`, `end`, `max_points` (target count, LTTB), `detrended` params |
-| GET | `/v1/velocities` | `VelocityCollection` (GeoJSON) | `region`, `window_years` filters |
-| GET | `/v1/models/{region}` | `ModelResult` | latest source model; Mogi first |
-| GET | `/v1/models/{region}/history` | `ModelHistory` | fit time-lapse; reserved in v0, wired Phase 2 |
-| GET | `/v1/layers` | `LayerCatalog` | typed, versioned overlay catalog |
-| POST | `/v1/query` | `QueryResponse` | complex selections via JSON body |
+| Method | Path | Returns | Status | Notes |
+|---|---|---|---|---|
+| GET | `/healthz` | `{"status","version"}` | live | liveness probe (unversioned) |
+| GET | `/v1/stations` | `StationCollection` (GeoJSON) | **wired** | cacheable catalog; fleet runs span all regions, `properties.regions` merged |
+| GET | `/v1/stations/{marker}/series` | `SeriesResponse` | **wired** | `start`, `end`, `max_points` (target count, LTTB), `detrended` params; server-side ceiling — see Amendment A3 |
+| GET | `/v1/velocities` | `VelocityCollection` (GeoJSON) | **wired** | `region`, `window_years` filters |
+| GET | `/v1/models/{region}` | `ModelResult` | **wired** | latest model products; `kind="breakpoints"` (GBIS4TS) first — see Amendment A2; Mogi reserved |
+| GET | `/v1/models/{region}/history` | `ModelHistory` | 501 | fit time-lapse; reserved in v0 (Decisions #5), needs run accumulation (Postgres slice) |
+| GET | `/v1/layers` | `LayerCatalog` | 501 | typed, versioned overlay catalog |
+| POST | `/v1/query` | `QueryResponse` | 501 | complex selections via JSON body |
 
 Authoritative field-level schemas live in `src/gps_api/schemas.py` and in the
 generated OpenAPI document (`/openapi.json`) — this file explains intent; the
@@ -114,6 +114,40 @@ code is the source of truth for shapes.
    schema in v0; Phase 2 wires it for the Svartsengi volume time-lapse and
    the reconciliation against Vincent's `inv_volume_mogi.dat`.
 
+## Amendments (fleet precompute rollout, 2026-07-11)
+
+Additive contract changes landed with the Phase-2 fleet slice; `schemas.py`
+changed in the same commit (the two are always changed together).
+
+- **A1 — velocity `method` values: `"wls" | "gbis"` (`"mle"` reserved).**
+  PLAN-analysis-lane §1: WLS is the fleet-wide baseline (fast, formal σ);
+  GBIS4TS is the honest-σ upgrade (joint break + colored-noise estimation),
+  selective per `breakpoints.enabled_regions` — never fleet-wide.
+- **A2 — `ModelResult.kind` values: `"mogi" | "breakpoints"`.** The
+  `"breakpoints"` kind serves the GBIS4TS break/rate-change catalog
+  (`models/<region>_breaks.json`) losslessly: `entries` is a list of
+  `BreakEntry` (marker, component, BPD1/BPD2 model tag, posterior-optimal
+  parameters incl. κ and noise amplitude, break epoch as UTC time,
+  `wn_amp_mm`, `y_ref_mm`, `n_runs`); `parameters` stays empty for this
+  kind (it belongs to the reserved `"mogi"` source-model kind).
+  `ModelResult.provenance`/`ModelFit.provenance` widened to carry the
+  structured provenance object products are stamped with.
+- **A3 — server-side `max_points` ceiling.** `analysis.yaml api.max_points`
+  is recorded by the precompute run in the store's `meta/run.json`; the
+  series endpoint applies it as the default LTTB target when the client
+  sends no `max_points` and clamps the client's value when it does
+  (`target = min(max_points, ceiling)`). A store without the key has no
+  ceiling. LTTB always keeps the first/last epoch of the served window,
+  and selects *real* observed points — served `sigma_*` stay the
+  observation uncertainties of exactly the points shown.
+- **A4 — fleet stores.** A `--fleet` precompute run writes one combined
+  `stations.geojson` across all configured regions (a station in several
+  regions lists them all, sorted, in `properties.regions`), per-region
+  velocity/break products, and a single fleet-shaped `meta/run.json`
+  (per-region + per-station success/failure counts). The API surface is
+  unchanged — the same endpoints serve single-region and fleet stores.
+
 ---
 
-*Drafted + reviewed 2026-07-08 (Phase 0). Owner: BGÓ.*
+*Drafted + reviewed 2026-07-08 (Phase 0). Amended 2026-07-11 (fleet slice:
+endpoint statuses, A1–A4). Owner: BGÓ.*
