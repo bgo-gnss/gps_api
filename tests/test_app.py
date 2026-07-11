@@ -5,6 +5,8 @@ is the *contract*: every route exists, every error is ``{"detail": …}``, and
 the OpenAPI document describes the full surface in docs/API_CONTRACT.md.
 """
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -16,7 +18,6 @@ client = TestClient(create_app())
 STUB_GET_ROUTES = [
     "/v1/stations",
     "/v1/stations/SENG/series",
-    "/v1/velocities",
     "/v1/models/reykjanes",
     "/v1/models/svartsengi/history",
     "/v1/layers",
@@ -62,6 +63,23 @@ def test_query_validation_error_uses_detail_shape() -> None:
 def test_unknown_route_uses_detail_shape() -> None:
     resp = client.get("/definitely-not-a-route")
     assert resp.status_code == 404
+    assert "detail" in resp.json()
+
+
+def test_velocities_empty_store_is_404_with_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/v1/velocities is store-wired: an empty store is a contract-shaped 404."""
+    monkeypatch.setenv("GPS_API_STORE", str(tmp_path))
+    resp = client.get("/v1/velocities")
+    assert resp.status_code == 404
+    assert isinstance(resp.json()["detail"], str)
+
+
+def test_velocities_rejects_pathy_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Region names are validated (no path characters reach the store)."""
+    resp = client.get("/v1/velocities", params={"region": "../etc"})
+    assert resp.status_code == 422
     assert "detail" in resp.json()
 
 

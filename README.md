@@ -9,8 +9,11 @@ Part of the post-processing revamp
 writes to the store (Postgres + Parquet/GeoJSON files); this API reads and
 serves; the Dash QC tool and the aflogun SPA are its consumers.
 
-**Status: Phase 0 scaffold.** All data endpoints are 501 stubs; the contract
-they will honour is `docs/API_CONTRACT.md` + `src/gps_api/schemas.py`.
+**Status: Phase-1 vertical slice.** The precompute job lives in this repo
+(`gps_api.precompute`, console script `gps-api-precompute`) and writes a
+file store (Parquet series, GeoJSON velocities/catalog, JSON break catalog);
+`GET /v1/velocities` serves it. The remaining data endpoints are 501 stubs;
+the contract is `docs/API_CONTRACT.md` + `src/gps_api/schemas.py`.
 
 ## Development
 
