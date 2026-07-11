@@ -28,6 +28,7 @@ dependencies = [
 
 [project.scripts]
 gps-api = "gps_api.main:run"
+gps-api-precompute = "gps_api.precompute.job:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -44,7 +45,28 @@ dev = [
     "ruff>=0.8",
     "black>=24.10",
     "mypy>=1.13",
+    "types-pyyaml>=6.0",
+    {include-group = "precompute"},
 ]
+# The precompute job (plan §3: "in gps_api or a sibling") lives in
+# gps_api.precompute. Its deps stay OUT of [project.dependencies]: the API
+# runtime never imports gps_analysis (CLAUDE.md rule) and serves the file
+# store with the stdlib only. Sibling packages are wired as editable local
+# paths via [tool.uv.sources] (gps_plot precedent — see gpslibrary/CLAUDE.md
+# "Editing Across Packages"); gps_analysis is on the analysis-lane-base
+# branch until the lane merges.
+precompute = [
+    "gps_analysis",
+    "gps_parser",
+    "gtimes>=0.5",
+    "numpy>=2.1",
+    "pyarrow>=18",
+    "pyyaml>=6.0",
+]
+
+[tool.uv.sources]
+gps_analysis = { path = "../gps_analysis", editable = true }
+gps_parser = { path = "../gps_parser", editable = true }
 
 [tool.ruff]
 target-version = "py313"
@@ -73,6 +95,15 @@ python_version = "3.13"
 strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
+
+# Untyped ecosystem imports used only by the precompute module: gps_parser
+# and gtimes ship no py.typed marker; pyarrow's inline typing is partial.
+# Their objects are treated as Any at the boundary; results are coerced to
+# concrete types immediately (see precompute/config.py, sources.py).
+[[tool.mypy.overrides]]
+module = ["gps_parser.*", "gtimes.*", "pyarrow.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 minversion = "8.0"
