@@ -15,3 +15,6 @@ htmlcov/
 
 # Knowledge graph (local redirect to the ecosystem root graph)
 graphify-out/
+
+# Real-data validation fixture (rebuild: gps-api-validate-deformation fetch)
+tests/fixtures/realdata/

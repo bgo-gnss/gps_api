@@ -19,8 +19,14 @@ Pipeline per gated region (config: ``deformation:`` in ``analysis.yaml``,
    ``min_stations``) enter a weighted NLLS Mogi inversion in a local
    tangent-plane frame (metres; origin from config or the participating-
    station centroid). Depth/ΔV bounds come from config; horizontal bounds
-   follow the ``mogi_invert`` footprint default. Each fit warm-starts from
-   the previous epoch's source.
+   follow the ``mogi_invert`` footprint default. Each epoch is inverted
+   from **two starting points** — the previous epoch's source (warm) and
+   the ``mogi_invert`` footprint default (cold) — keeping the lower-χ²
+   solution (:func:`_invert_epoch`). The problem is non-convex on real
+   displacement fields: a warm start alone can trap the whole remaining
+   series in one epoch's pathological local minimum (observed on real
+   Svartsengi data — depth pinned at its bound while the misfit grew
+   monotonically; see ``docs/VALIDATION_svartsengi_deformation.md``).
 3. **Optional Bayesian tail.** When ``bayes.n_runs > 0``, the newest
    fitted epoch also gets a GBIS posterior (``mogi_invert_bayes``) whose
    percentile summary rides on the product — honest uncertainties next to
@@ -46,6 +52,7 @@ import sys
 import numpy as np
 from gps_analysis import (
     InversionConfig,
+    MogiFit,
     MogiSource,
     PriorBounds,
     local_coordinates,
@@ -179,6 +186,83 @@ def _mogi_bounds(
     return lower, upper
 
 
+#: Interior-solution tolerance as a fraction of each finite bound range —
+#: an optimum closer than this to a bound counts as pinned (non-interior).
+_BOUND_TOL_FRACTION = 1e-3
+
+
+def _is_interior(fit: MogiFit, bounds: tuple[FloatArray, FloatArray]) -> bool:
+    """Whether the optimum sits strictly inside its finite bounds.
+
+    A bound-pinned NLLS solution is not a credible source estimate — on
+    real fields it is how a far/deep phantom source absorbs common-mode
+    noise (observed on real Svartsengi data: depth at its bound, position
+    at the footprint edge, |ΔV| in the 10⁸–10⁹ m³ range). Parameters with
+    an infinite bound (unbounded ΔV) are exempt.
+    """
+    params = fit.source.as_array()
+    lower, upper = bounds
+    finite = np.isfinite(lower) & np.isfinite(upper)
+    tol = np.where(finite, _BOUND_TOL_FRACTION * (upper - lower), 0.0)
+    inside = (params >= lower + tol) & (params <= upper - tol)
+    return bool(np.all(inside | ~finite))
+
+
+def _invert_epoch(
+    e_arr: FloatArray,
+    n_arr: FloatArray,
+    obs: FloatArray,
+    sig: FloatArray,
+    bounds: tuple[FloatArray, FloatArray],
+    nu: float,
+    warm_start: MogiSource | None,
+) -> MogiFit:
+    """One epoch's Mogi inversion — multi-start, best *interior* fit wins.
+
+    The weighted NLLS problem is non-convex on real displacement fields;
+    a fit chained only off the previous epoch's optimum (warm start) can
+    fall into — and then propagate — a local minimum it never escapes.
+    Each epoch therefore also gets a cold start (``x0=None`` — the
+    ``mogi_invert`` network-footprint default); candidates pinned at a
+    parameter bound are rejected (:func:`_is_interior`), and the lowest
+    reduced-χ² interior solution is kept. This is a robustness guard of
+    the productized stage, not a change to the estimator (every candidate
+    comes from the same ``gps_analysis.mogi_invert``).
+
+    Raises:
+        RuntimeError: When no start yields an interior optimum — the
+            caller counts the epoch as skipped (recorded, never silent).
+        ValueError: When every start fails outright in ``mogi_invert``.
+    """
+    best: MogiFit | None = None
+    error: Exception | None = None
+    pinned = 0
+    starts: tuple[MogiSource | None, ...] = (
+        (warm_start, None) if warm_start is not None else (None,)
+    )
+    for x0 in starts:
+        try:
+            fit = mogi_invert(e_arr, n_arr, obs, sig, x0=x0, bounds=bounds, nu=nu)
+        except (RuntimeError, ValueError) as exc:
+            error = exc
+            continue
+        if not _is_interior(fit, bounds):
+            pinned += 1
+            continue
+        if best is None or fit.chi2_reduced < best.chi2_reduced:
+            best = fit
+    if best is None:
+        if pinned:
+            raise RuntimeError(
+                f"no interior optimum — {pinned} start(s) converged onto a "
+                "parameter bound (phantom far/deep source); widen the "
+                "configured bounds only if a boundary source is physical"
+            )
+        assert error is not None  # starts is never empty
+        raise error
+    return best
+
+
 def compute_mogi_series(
     region_name: str,
     station_series: dict[str, StationSeries],
@@ -293,15 +377,7 @@ def compute_mogi_series(
         sig = np.column_stack(sig_cols)
         bounds = _mogi_bounds(e_arr, n_arr, cfg)
         try:
-            fit = mogi_invert(
-                e_arr,
-                n_arr,
-                obs,
-                sig,
-                x0=warm_start,
-                bounds=bounds,
-                nu=cfg.nu,
-            )
+            fit = _invert_epoch(e_arr, n_arr, obs, sig, bounds, cfg.nu, warm_start)
         except (RuntimeError, ValueError) as exc:
             epochs_skipped += 1
             print(
