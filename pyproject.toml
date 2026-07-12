@@ -34,6 +34,7 @@ dependencies = [
 [project.scripts]
 gps-api = "gps_api.main:run"
 gps-api-precompute = "gps_api.precompute.job:main"
+gps-api-validate-deformation = "gps_api.validation.realdata:main"
 
 [build-system]
 requires = ["hatchling"]

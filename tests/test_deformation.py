@@ -449,3 +449,53 @@ def test_velocity_method_gbis_stays_a_later_slice(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="gbis"):
         cfg.velocity_method_for("r")
+
+
+# ---------------------------------------------------------------------------
+# Multi-start + interior-solution guard (real-data validation follow-up):
+# the per-epoch inversion must not propagate a warm-start local minimum and
+# must reject optima pinned at a parameter bound (phantom far/deep sources).
+# Found on real Svartsengi data — docs/VALIDATION_svartsengi_deformation.md.
+# ---------------------------------------------------------------------------
+
+
+def _mogi_epoch_field(
+    dv: float, depth: float = 4000.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Noise-free (e, n, obs, sig) for one epoch of a planted Mogi source."""
+    e = np.array([-3000.0, 4000.0, -1000.0, 2500.0, 500.0])
+    n = np.array([2000.0, -1500.0, -3500.0, 3000.0, 500.0])
+    obs = mogi_forward(e, n, MogiSource(0.0, 0.0, depth, dv))
+    sig = np.full_like(obs, 1.0e-3)
+    return e, n, obs, sig
+
+
+def test_invert_epoch_recovers_from_pathological_warm_start() -> None:
+    """A warm start parked in a far corner must not trap the epoch fit."""
+    from gps_api.precompute.deformation import _invert_epoch
+
+    e, n, obs, sig = _mogi_epoch_field(dv=5.0e6)
+    bounds = (
+        np.array([-30e3, -30e3, 100.0, -np.inf]),
+        np.array([30e3, 30e3, 20e3, np.inf]),
+    )
+    bad_warm = MogiSource(x=25e3, y=-25e3, depth=150.0, dv=-1.0e6)
+    fit = _invert_epoch(e, n, obs, sig, bounds, 0.25, bad_warm)
+    assert fit.source.dv == pytest.approx(5.0e6, rel=0.05)
+    assert fit.source.depth == pytest.approx(4000.0, rel=0.05)
+    assert abs(fit.source.x) < 500.0 and abs(fit.source.y) < 500.0
+
+
+def test_invert_epoch_rejects_bound_pinned_optima() -> None:
+    """Bounds excluding the true source leave only pinned optima — skip."""
+    from gps_api.precompute.deformation import _invert_epoch
+
+    e, n, obs, sig = _mogi_epoch_field(dv=5.0e6, depth=2000.0)
+    # Depth bounds far above the planted 2 km source: every start rides
+    # down onto the lower bound instead of reaching an interior optimum.
+    bounds = (
+        np.array([-30e3, -30e3, 15e3, -np.inf]),
+        np.array([30e3, 30e3, 20e3, np.inf]),
+    )
+    with pytest.raises(RuntimeError, match="no interior optimum"):
+        _invert_epoch(e, n, obs, sig, bounds, 0.25, None)

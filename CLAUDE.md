@@ -73,6 +73,19 @@ when `deformation.bayes.n_runs > 0`). A stage failure is recorded
 product is an **independent GNSS-only** analog of Vincent's operational
 Mogi ΔV(t) (`insar.vedur.is:.../inv_volume_mogi.dat`) — cross-checked
 against his, never derived from his files. CLI: `--no-deformation`.
+Per-epoch fits are multi-start (warm + cold) with bound-pinned optima
+rejected (`_invert_epoch`/`_is_interior`) — real-data robustness fix
+2026-07-12, see `docs/VALIDATION_svartsengi_deformation.md`.
+
+**Real-data validation** (2026-07-12): `gps_api.validation.realdata` +
+`gps-api-validate-deformation` reconcile the pipeline on real Svartsengi
+`.NEU` (CDN) against the operational model (read-only SSH,
+`/mnt/scratch/vincent/model/svartsengi/` — file formats characterized in
+the module docstring). Baseline (inflation08): ΔV(t) r=0.993, final ratio
+0.85, free depth 3.7±1.0 km vs fixed 4.0, source 0.32 km off — verdict +
+numbers in `docs/VALIDATION_svartsengi_deformation.md`. Fixture
+`tests/fixtures/realdata/` is gitignored (`fetch` subcommand rebuilds);
+`tests/test_validation_realdata.py` is skipped without it.
 
 **Parallel breaks + triage** (`precompute/breaks.py`, perf-audit #1/#6 +
 plan §10.7): the gated GBIS4TS chains fan out over a
@@ -92,12 +105,14 @@ identical summaries to the old serial path (tests pin exact equality).
 ```
 src/gps_api/{main.py, schemas.py, settings.py, downsample.py,
              routers/{stations,velocities,models,deformation,layers,query}.py,
-             precompute/{config,sources,products,job,breaks,deformation}.py}
+             precompute/{config,sources,products,job,breaks,deformation}.py,
+             validation/realdata.py}  # real-data harness (precompute-side)
 tests/test_app.py         # contract-shape tests (routes, 404/501+detail, OpenAPI)
 tests/test_precompute.py  # end-to-end: config → precompute (region + fleet) → store → wired endpoints
 tests/test_breaks_parallel.py  # pool==serial parity, triage flags, bounded summaries, fault tolerance
 tests/test_deformation.py # Mogi ΔV(t) recovery + MLE velocities + gating + endpoint + fault tolerance
 tests/test_downsample.py  # LTTB property tests + single-channel reference parity
+tests/test_validation_realdata.py  # env-gated real-data reconciliation (skipped w/o fixture)
 ```
 
 ```bash
@@ -119,7 +134,8 @@ uv run mypy src tests && uv run pytest
   those imports are allowed.
 
 ---
-*Last reviewed: 2026-07-12 (productize-mogi-mle: Mogi ΔV(t) deformation
-products + `/v1/deformation/{region}` + per-region MLE velocities,
-Amendments A5–A6; same day: fleet-parallel-mcmc pooled GBIS4TS chains +
-triage→confirm; prior review 2026-07-11 fleet rollout, Amendments A1–A4)*
+*Last reviewed: 2026-07-12 (validate-deformation-realdata: real Svartsengi
+reconciliation vs the operational model + multi-start/interior-guard fix in
+the Mogi stage; same day: productize-mogi-mle Amendments A5–A6 and
+fleet-parallel-mcmc pooled GBIS4TS chains + triage→confirm; prior review
+2026-07-11 fleet rollout, Amendments A1–A4)*
