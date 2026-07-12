@@ -26,7 +26,11 @@ rule):
    §7), so the job must NOT pre-reference it. **Cost gate:** GBIS4TS runs
    only for the regions in ``breakpoints.enabled_regions`` (selective by
    design — WLS is the fleet-wide baseline; the 1e6-iteration chains are
-   never run across all stations).
+   never run across all stations). The chains themselves are fanned out
+   over a process pool with an optional triage -> confirm screening stage
+   (:mod:`gps_api.precompute.breaks` — perf-audit #1/#6, plan §10.7):
+   the cheap per-station stages (fit/detrend/velocity/Parquet) stay
+   inline; only the MCMC work items are parallelized.
 
 Products land in the file store (:mod:`gps_api.precompute.products`);
 ``GET /v1/velocities`` serves the velocity GeoJSON directly.
@@ -47,8 +51,6 @@ from typing import Any
 
 import numpy as np
 from gps_analysis import (
-    InversionResult,
-    detect_breakpoints,
     estimate_velocity,
     fit_components,
     linear,
@@ -58,6 +60,12 @@ from gps_analysis import (
 
 from gps_api import settings
 from gps_api.precompute import products
+from gps_api.precompute.breaks import (
+    BreakSummary,
+    ComponentTask,
+    TriageStats,
+    detect_station_breaks,
+)
 from gps_api.precompute.config import (
     AnalysisConfig,
     StationMeta,
@@ -230,21 +238,21 @@ def _velocity_feature(
     )
 
 
-def _break_parameters(result: InversionResult) -> dict[str, float]:
-    """Flatten ``InversionResult.optimal`` (MATLAB order) to named floats.
+def _break_parameters(model: str, optimal: Sequence[float]) -> dict[str, float]:
+    """Flatten an optimal parameter vector (MATLAB order) to named floats.
 
     BPD1: ``[a, v, g, t_b, κ, β]``; BPD2: ``[a, v, g1, t_b1, g2, t_b2, κ, β]``
     — intercept mm, secular rate mm/yr, rate change(s) mm/yr, break
     epoch(s) yr, colored-noise spectral index κ and amplitude β.
     """
-    opt = [float(v) for v in result.optimal]
+    opt = [float(v) for v in optimal]
     parameters = {
         "intercept_mm": opt[0],
         "trend_mm_yr": opt[1],
         "trend_change_mm_yr": opt[2],
         "breakpoint_yearf": opt[3],
     }
-    if result.model == "BPD2":
+    if model == "BPD2":
         parameters["trend_change2_mm_yr"] = opt[4]
         parameters["breakpoint2_yearf"] = opt[5]
     parameters["kappa"] = opt[-2]
@@ -252,57 +260,63 @@ def _break_parameters(result: InversionResult) -> dict[str, float]:
     return parameters
 
 
-def _station_breaks(
+def _station_break_tasks(
     series: StationSeries,
     detrended: FloatArray,
-    fitted_at: datetime.datetime,
     *,
     n_breaks: int,
     n_runs: int,
     t_runs: int,
     seed: int | None,
-) -> list[dict[str, Any]]:
-    """GBIS4TS break detection per component → break-catalog entries.
+) -> list[ComponentTask]:
+    """Per-component GBIS4TS work items for one station (confirm settings).
 
-    The displacement series goes straight to
-    :func:`~gps_analysis.detect_breakpoints` (it zero-references
-    internally — do not pre-reference here). The fixed white-noise
-    amplitude follows the dev-viz heuristic: median observation σ, or the
-    residual std when the source carries no σ.
+    The displacement series goes straight into the task (the estimator
+    zero-references internally — do not pre-reference here). The fixed
+    white-noise amplitude follows the dev-viz heuristic: median
+    observation σ, or the residual std when the source carries no σ.
     """
-    entries: list[dict[str, Any]] = []
+    tasks: list[ComponentTask] = []
     for i, component in enumerate(COMPONENTS):
         if series.sigma is not None:
             wn_amp = float(np.median(series.sigma[i]))
         else:
             wn_amp = float(np.std(detrended[i]))
-        result = detect_breakpoints(
-            series.t,
-            series.y[i],
-            wn_amp,
-            n_breaks=n_breaks,
-            n_runs=n_runs,
-            t_runs=t_runs,
-            seed=seed,
+        tasks.append(
+            ComponentTask(
+                marker=series.marker,
+                component=component,
+                t=series.t,
+                y=series.y[i],
+                wn_amp=wn_amp,
+                n_breaks=n_breaks,
+                n_runs=n_runs,
+                t_runs=t_runs,
+                seed=seed,
+            )
         )
-        parameters = _break_parameters(result)
-        entries.append(
-            {
-                "marker": series.marker,
-                "component": component,
-                "model": result.model,
-                "method": "gbis",
-                "fitted_at": fitted_at.isoformat().replace("+00:00", "Z"),
-                "breakpoint_time": yearf_to_datetime(parameters["breakpoint_yearf"])
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "parameters": parameters,
-                "wn_amp_mm": wn_amp,
-                "y_ref_mm": float(result.y_ref),
-                "n_runs": n_runs,
-            }
-        )
-    return entries
+    return tasks
+
+
+def _entry_from_summary(
+    summary: BreakSummary, fitted_at: datetime.datetime
+) -> dict[str, Any]:
+    """One break-catalog entry (contract ``BreakEntry`` shape) per chain."""
+    parameters = _break_parameters(summary.model, summary.optimal)
+    return {
+        "marker": summary.marker,
+        "component": summary.component,
+        "model": summary.model,
+        "method": "gbis",
+        "fitted_at": fitted_at.isoformat().replace("+00:00", "Z"),
+        "breakpoint_time": yearf_to_datetime(parameters["breakpoint_yearf"])
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "parameters": parameters,
+        "wn_amp_mm": summary.wn_amp,
+        "y_ref_mm": summary.y_ref,
+        "n_runs": summary.n_runs,
+    }
 
 
 def run_precompute(
@@ -315,6 +329,9 @@ def run_precompute(
     detect_breaks: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
+    triage_n_runs: int | None = None,
+    triage_t_runs: int | None = None,
+    max_workers: int | None = None,
     seed: int | None = 0,
     write_catalog: bool = True,
     write_meta: bool = True,
@@ -330,9 +347,18 @@ def run_precompute(
         source: Provenance tag describing the data source for the run.
         detect_breaks: Force break detection on/off; ``None`` follows
             ``breakpoints.enabled_regions`` in the config.
-        n_runs / t_runs: Override the configured GBIS4TS chain lengths
-            (dev runs; production uses the configured 1e6).
-        seed: MCMC RNG seed (reproducibility).
+        n_runs / t_runs: Override the configured GBIS4TS confirm chain
+            lengths (dev runs; production uses the configured 1e6).
+        triage_n_runs / triage_t_runs: Override the configured triage
+            screen chain lengths; ``None`` follows
+            ``breakpoints.triage_n_runs`` / ``triage_t_runs`` (a resolved
+            value of 0 keeps triage off — every gated station confirmed).
+        max_workers: Override ``breakpoints.max_workers`` for the break
+            chain process pool (``None`` follows the config; the config's
+            own default is one worker per core, capped at the number of
+            chains; 0 runs inline).
+        seed: MCMC RNG seed (reproducibility — pooled chains use exactly
+            the per-call seeds the serial path used, so results match).
         write_catalog / write_meta: Whether to write ``stations.geojson``
             and ``meta/run.json`` (defaults on). :func:`run_fleet` turns
             both off per region and writes the combined catalog + fleet
@@ -356,10 +382,23 @@ def run_precompute(
     )
     runs = cfg.breakpoints.n_runs if n_runs is None else n_runs
     truns = cfg.breakpoints.t_runs if t_runs is None else t_runs
+    triage_runs = (
+        cfg.breakpoints.triage_n_runs if triage_n_runs is None else triage_n_runs
+    )
+    triage_truns = (
+        cfg.breakpoints.triage_t_runs if triage_t_runs is None else triage_t_runs
+    )
+    workers = cfg.breakpoints.max_workers if max_workers is None else max_workers
     if breaks_on and 16 * truns >= runs:
         raise ValueError(
             f"breakpoints: n_runs ({runs}) must exceed the annealing span "
             f"16*t_runs ({16 * truns}) — adjust analysis.yaml or --runs/--t-runs"
+        )
+    if breaks_on and triage_runs > 0 and 16 * triage_truns >= triage_runs:
+        raise ValueError(
+            f"breakpoints: triage_n_runs ({triage_runs}) must exceed the "
+            f"annealing span 16*triage_t_runs ({16 * triage_truns}) — adjust "
+            "analysis.yaml or --triage-runs/--triage-t-runs"
         )
 
     def _provenance(method: str, **extra: Any) -> Provenance:
@@ -373,6 +412,8 @@ def run_precompute(
 
     velocity_features: list[VelocityFeature] = []
     break_entries: list[dict[str, Any]] = []
+    break_tasks: dict[str, list[ComponentTask]] = {}
+    triage_stats: TriageStats | None = None
     written: list[str] = []
     ok: list[str] = []
     failed: dict[str, str] = {}
@@ -417,22 +458,41 @@ def run_precompute(
             )
             print(f"[{marker}] trajectory fit + WLS velocity done", flush=True)
             if breaks_on:
-                break_entries.extend(
-                    _station_breaks(
-                        series,
-                        detrended,
-                        fitted_at,
-                        n_breaks=cfg.breakpoints.n_breaks,
-                        n_runs=runs,
-                        t_runs=truns,
-                        seed=seed,
-                    )
+                # Chains are the fleet's cost — queue them for the pool
+                # instead of running the MCMC inline (perf-audit #1).
+                break_tasks[marker] = _station_break_tasks(
+                    series,
+                    detrended,
+                    n_breaks=cfg.breakpoints.n_breaks,
+                    n_runs=runs,
+                    t_runs=truns,
+                    seed=seed,
                 )
-                print(f"[{marker}] GBIS4TS break detection done", flush=True)
             ok.append(marker)
         except Exception as exc:  # noqa: BLE001 — batch survives one bad station
             failed[marker] = f"{type(exc).__name__}: {exc}"
             print(f"[{marker}] FAILED — {failed[marker]}", file=sys.stderr, flush=True)
+
+    if breaks_on and break_tasks:
+        outcome = detect_station_breaks(
+            break_tasks,
+            triage_n_runs=triage_runs,
+            triage_t_runs=triage_truns,
+            triage_sigma=cfg.breakpoints.triage_sigma,
+            max_workers=workers,
+        )
+        triage_stats = outcome.triage
+        for marker, reason in outcome.failures.items():
+            # Same semantics as the serial path: a station whose break
+            # detection failed is recorded as failed (its series/velocity
+            # products, already written, stay in the store).
+            failed[marker] = reason
+            ok.remove(marker)
+        for marker in region.stations:  # station order, component order
+            break_entries.extend(
+                _entry_from_summary(summary, fitted_at)
+                for summary in outcome.summaries.get(marker, ())
+            )
 
     if not ok:
         raise RuntimeError(
@@ -475,19 +535,29 @@ def run_precompute(
         )
     )
     if breaks_on:
+        gbis_extra: dict[str, Any] = {
+            "n_breaks": cfg.breakpoints.n_breaks,
+            "n_runs": runs,
+            "t_runs": truns,
+            "seed": seed,
+        }
+        if triage_stats is not None:
+            # Triage is never a silent cap: the screen/flag counts ride in
+            # the product provenance (and were logged during the run).
+            gbis_extra["triage"] = {
+                "n_runs": triage_stats.n_runs,
+                "t_runs": triage_stats.t_runs,
+                "sigma": triage_stats.sigma,
+                "stations_screened": triage_stats.stations_screened,
+                "stations_flagged": list(triage_stats.stations_flagged),
+            }
         written.append(
             str(
                 products.write_breaks_json(
                     store,
                     region.name,
                     break_entries,
-                    _provenance(
-                        "gbis",
-                        n_breaks=cfg.breakpoints.n_breaks,
-                        n_runs=runs,
-                        t_runs=truns,
-                        seed=seed,
-                    ),
+                    _provenance("gbis", **gbis_extra),
                 )
             )
         )
@@ -516,6 +586,9 @@ def run_fleet(
     detect_breaks: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
+    triage_n_runs: int | None = None,
+    triage_t_runs: int | None = None,
+    max_workers: int | None = None,
     seed: int | None = 0,
 ) -> FleetSummary:
     """Run the precompute for **every** configured region into one store.
@@ -544,8 +617,9 @@ def run_fleet(
         series_loader: ``marker -> StationSeries`` shared by all regions.
         store: Store root directory (created as needed).
         source: Provenance tag describing the data source for the run.
-        detect_breaks / n_runs / t_runs / seed: Passed through to
-            :func:`run_precompute` (same semantics).
+        detect_breaks / n_runs / t_runs / triage_n_runs / triage_t_runs /
+            max_workers / seed: Passed through to :func:`run_precompute`
+            (same semantics).
 
     Raises:
         RuntimeError: When every configured region failed.
@@ -567,6 +641,9 @@ def run_fleet(
                 detect_breaks=detect_breaks,
                 n_runs=n_runs,
                 t_runs=t_runs,
+                triage_n_runs=triage_n_runs,
+                triage_t_runs=triage_t_runs,
+                max_workers=max_workers,
                 seed=seed,
                 write_catalog=False,
                 write_meta=False,
@@ -728,6 +805,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "temperature; 16*t_runs must stay below the run count)",
     )
     parser.add_argument(
+        "--triage-runs",
+        type=int,
+        help="override breakpoints.triage_n_runs (short screening chains "
+        "of the triage->confirm stage; 0 disables triage so every gated "
+        "station gets the full confirm chain)",
+    )
+    parser.add_argument(
+        "--triage-t-runs",
+        type=int,
+        help="override breakpoints.triage_t_runs (annealing iterations of "
+        "the screening chains; 16*triage_t_runs must stay below "
+        "triage_n_runs)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="override breakpoints.max_workers (break-detection process "
+        "pool size; default: one worker per CPU core, capped at the "
+        "number of station x component chains; 0 runs the chains inline)",
+    )
+    parser.add_argument(
         "--no-breakpoints",
         action="store_true",
         help="skip GBIS4TS break detection (velocities + series only)",
@@ -766,6 +864,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             detect_breaks=False if args.no_breakpoints else None,
             n_runs=args.runs,
             t_runs=args.t_runs,
+            triage_n_runs=args.triage_runs,
+            triage_t_runs=args.triage_t_runs,
+            max_workers=args.workers,
             seed=args.seed,
         )
         print(
@@ -790,6 +891,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         detect_breaks=False if args.no_breakpoints else None,
         n_runs=args.runs,
         t_runs=args.t_runs,
+        triage_n_runs=args.triage_runs,
+        triage_t_runs=args.triage_t_runs,
+        max_workers=args.workers,
         seed=args.seed,
     )
     print(

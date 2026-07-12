@@ -57,6 +57,19 @@ station is skipped inside its region, a bad region is skipped by the fleet.
 GBIS4TS stays gated by `breakpoints.enabled_regions` — WLS is the
 fleet-wide baseline; never run the 1e6 chains across all stations.
 
+**Parallel breaks + triage** (`precompute/breaks.py`, perf-audit #1/#6 +
+plan §10.7): the gated GBIS4TS chains fan out over a
+`ProcessPoolExecutor` (spawn; workers return 256-byte scalar
+`BreakSummary`s, never the ~64 MB kept chain — memory stays ~workers×1
+chain). Optional triage→confirm: `breakpoints.triage_n_runs > 0` screens
+every gated station with a short chain and confirms only stations whose
+trend-change posterior `|mean|/std` ≥ `triage_sigma`; flagged/screened
+counts are logged and stamped into the breaks-product provenance (never a
+silent cap). Config keys: `triage_n_runs` (0 = off, default),
+`triage_t_runs`, `triage_sigma`, `max_workers` (absent → cpu count,
+0 = inline); CLI `--triage-runs/--triage-t-runs/--workers`. Same seed →
+identical summaries to the old serial path (tests pin exact equality).
+
 ## Layout & commands
 
 ```
@@ -65,6 +78,7 @@ src/gps_api/{main.py, schemas.py, settings.py, downsample.py,
              precompute/{config,sources,products,job}.py}
 tests/test_app.py         # contract-shape tests (routes, 404/501+detail, OpenAPI)
 tests/test_precompute.py  # end-to-end: config → precompute (region + fleet) → store → wired endpoints
+tests/test_breaks_parallel.py  # pool==serial parity, triage flags, bounded summaries, fault tolerance
 tests/test_downsample.py  # LTTB property tests + single-channel reference parity
 ```
 
@@ -87,5 +101,6 @@ uv run mypy src tests && uv run pytest
   those imports are allowed.
 
 ---
-*Last reviewed: 2026-07-11 (fleet rollout: `run_fleet`/`--fleet`, wired
-stations/series/models endpoints, LTTB, contract Amendments A1–A4)*
+*Last reviewed: 2026-07-12 (fleet-parallel-mcmc: pooled GBIS4TS chains +
+triage→confirm; prior review 2026-07-11 fleet rollout — stations/series/models
+endpoints, LTTB, contract Amendments A1–A4)*
