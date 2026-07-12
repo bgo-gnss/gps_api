@@ -58,12 +58,28 @@ class RegionConfig:
 
 @dataclasses.dataclass(frozen=True)
 class BreakpointConfig:
-    """GBIS4TS break-point detection settings (``breakpoints:`` block)."""
+    """GBIS4TS break-point detection settings (``breakpoints:`` block).
+
+    ``n_runs``/``t_runs`` are the **confirm** chain lengths (production
+    1e6). The triage stage (plan §10.7 two-stage screen -> confirm) is
+    driven by ``triage_n_runs``: when > 0, every gated station is first
+    screened with a short ``triage_n_runs`` chain and only stations whose
+    trend-change posterior significance reaches ``triage_sigma`` get the
+    full confirm chain; ``0`` (the default) disables triage — every gated
+    station is confirmed, the pre-triage behavior. ``max_workers`` sizes
+    the break-detection process pool (``null``/absent -> one worker per
+    CPU core, capped at the number of station x component chains; ``0``
+    -> inline serial execution).
+    """
 
     enabled_regions: tuple[str, ...]
     n_breaks: int
     n_runs: int
     t_runs: int
+    triage_n_runs: int = 0
+    triage_t_runs: int = 100
+    triage_sigma: float = 3.0
+    max_workers: int | None = None
 
     def enabled_for(self, region: str) -> bool:
         """Whether break detection is configured for ``region``."""
@@ -178,6 +194,16 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
             n_breaks=int(breaks.get("n_breaks_default", 1)),
             n_runs=int(breaks.get("n_runs", 1_000_000)),
             t_runs=int(breaks.get("t_runs", 1000)),
+            # Two-stage triage -> confirm (plan §10.7): 0 keeps triage off.
+            triage_n_runs=int(breaks.get("triage_n_runs", 0)),
+            triage_t_runs=int(breaks.get("triage_t_runs", 100)),
+            triage_sigma=float(breaks.get("triage_sigma", 3.0)),
+            # Break-detection pool size; absent/null -> min(cpu_count, chains).
+            max_workers=(
+                int(breaks["max_workers"])
+                if breaks.get("max_workers") is not None
+                else None
+            ),
         ),
         store_path=Path(str(store["path"])).expanduser() if store.get("path") else None,
         neu_dir=(
