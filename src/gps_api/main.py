@@ -7,14 +7,15 @@ rasters). The scheduled precompute job writes; this API only reads.
 Contract: ``docs/API_CONTRACT.md`` (v0, reviewed 2026-07-08). Data endpoints
 mount under ``/v1``; ``/healthz`` stays unversioned. Store-wired:
 ``/v1/stations``, ``/v1/stations/{marker}/series``, ``/v1/velocities``,
-``/v1/models/{region}``. Still 501: ``/v1/models/{region}/history``
-(reserved, contract Decisions #5), ``/v1/layers``, ``/v1/query``.
+``/v1/models/{region}``, ``/v1/deformation/{region}``. Still 501:
+``/v1/models/{region}/history`` (reserved, contract Decisions #5),
+``/v1/layers``, ``/v1/query``.
 """
 
 from fastapi import FastAPI
 
 from gps_api import __version__
-from gps_api.routers import layers, models, query, stations, velocities
+from gps_api.routers import deformation, layers, models, query, stations, velocities
 
 
 def create_app() -> FastAPI:
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
         stations.router,
         velocities.router,
         models.router,
+        deformation.router,
         layers.router,
         query.router,
     ):

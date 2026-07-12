@@ -6,8 +6,10 @@ which ``gps_parser.ConfigParser`` resolves (``$GPS_CONFIG_PATH`` or
 ``~/.config/gpsconfig``). Two files feed this module:
 
 - ``analysis.yaml`` — the analysis-lane sidecar (regions, velocity window +
-  method, detrend model + overrides, break-point settings, optional
-  ``store.path`` / ``data.neu_dir`` / ``api.max_points``). Template:
+  method incl. per-region ``velocity_method`` overrides, detrend model +
+  overrides, break-point settings, the ``deformation:`` block gating the
+  Mogi source-inversion stage, optional ``store.path`` / ``data.neu_dir``
+  / ``api.max_points``). Template:
   ``gpslibrary/config-templates/analysis-lane/analysis.yaml``; it deploys
   through ``gps-config-data`` like every other cfg.
 - ``stations.cfg`` — station coordinates (``latitude``/``longitude``/
@@ -54,6 +56,11 @@ class RegionConfig:
     stations: tuple[str, ...]
     reference_frame: str
     description: str | None = None
+    #: Per-region velocity estimator override (``velocity_method:`` key);
+    #: ``None`` falls back to ``velocity.default_method``. ``"mle"`` selects
+    #: the colored-noise MLE (honest σ) where the region's noise earns it —
+    #: WLS stays the fleet-wide baseline (contract Amendment A5).
+    velocity_method: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,6 +93,96 @@ class BreakpointConfig:
         return region in self.enabled_regions
 
 
+#: Velocity estimators the precompute job implements (Amendment A5).
+VELOCITY_METHODS: tuple[str, ...] = ("wls", "mle")
+
+#: Deformation source models the precompute job implements (Amendment A6).
+DEFORMATION_SOURCES: tuple[str, ...] = ("mogi",)
+
+
+@dataclasses.dataclass(frozen=True)
+class DeformationConfig:
+    """Mogi deformation-source inversion settings (``deformation:`` block).
+
+    Config-gated exactly like break detection: the stage runs only for
+    ``enabled_regions``. Per gated region, station displacements relative
+    to the start of a trailing ``window_years`` window are averaged over
+    ``epoch_mean_days`` around each grid epoch (spaced ``step_days``) and
+    inverted for one Mogi source per epoch (``gps_analysis.mogi_invert``)
+    — the ΔV(t)/depth/position time-series product of Amendment A6. When
+    ``bayes_n_runs > 0`` the newest epoch additionally gets a Bayesian
+    posterior (``gps_analysis.mogi_invert_bayes``; requires finite
+    ``dv_bounds_m3`` priors). ``origin_lon``/``origin_lat`` pin the local
+    tangent-plane frame; absent → the mean of the participating station
+    coordinates.
+    """
+
+    enabled_regions: tuple[str, ...]
+    source: str = "mogi"
+    series: str = "raw"
+    window_years: float = 1.0
+    step_days: float = 7.0
+    epoch_mean_days: float = 10.0
+    min_stations: int = 3
+    nu: float = 0.25
+    depth_bounds_km: tuple[float, float] = (0.1, 20.0)
+    dv_bounds_m3: tuple[float, float] | None = None
+    origin_lon: float | None = None
+    origin_lat: float | None = None
+    bayes_n_runs: int = 0
+    bayes_t_runs: int = 100
+
+    def __post_init__(self) -> None:
+        if self.source not in DEFORMATION_SOURCES:
+            raise ValueError(
+                f"deformation.source={self.source!r} — implemented sources: "
+                f"{DEFORMATION_SOURCES} ('okada' arrives with a later slice)"
+            )
+        if self.series not in ("raw", "detrended"):
+            raise ValueError(
+                f"deformation.series={self.series!r} — must be 'raw' or 'detrended'"
+            )
+        for key in ("window_years", "step_days", "epoch_mean_days"):
+            if getattr(self, key) <= 0:
+                raise ValueError(f"deformation.{key} must be > 0")
+        if self.min_stations < 2:
+            raise ValueError(
+                "deformation.min_stations must be >= 2 (mogi_invert needs "
+                ">= 2 stations for 4 parameters)"
+            )
+        lo, hi = self.depth_bounds_km
+        if not 0 < lo < hi:
+            raise ValueError(
+                f"deformation.depth_bounds_km must satisfy 0 < lower < upper, "
+                f"got {self.depth_bounds_km}"
+            )
+        if self.dv_bounds_m3 is not None and not (
+            self.dv_bounds_m3[0] < self.dv_bounds_m3[1]
+        ):
+            raise ValueError(
+                f"deformation.dv_bounds_m3 must satisfy lower < upper, "
+                f"got {self.dv_bounds_m3}"
+            )
+        if (self.origin_lon is None) != (self.origin_lat is None):
+            raise ValueError("deformation.origin needs both lon and lat (or neither)")
+        if self.bayes_n_runs > 0:
+            if self.dv_bounds_m3 is None:
+                raise ValueError(
+                    "deformation.bayes needs finite dv_bounds_m3 — uniform "
+                    "priors of the Bayesian inversion cannot be unbounded"
+                )
+            if 16 * self.bayes_t_runs >= self.bayes_n_runs:
+                raise ValueError(
+                    f"deformation.bayes: n_runs ({self.bayes_n_runs}) must "
+                    f"exceed the annealing span 16*t_runs "
+                    f"({16 * self.bayes_t_runs})"
+                )
+
+    def enabled_for(self, region: str) -> bool:
+        """Whether the deformation stage is configured for ``region``."""
+        return region in self.enabled_regions
+
+
 @dataclasses.dataclass(frozen=True)
 class AnalysisConfig:
     """Everything the precompute job reads from configuration."""
@@ -98,6 +195,10 @@ class AnalysisConfig:
     detrend_model: str
     detrend_overrides: dict[str, str]
     breakpoints: BreakpointConfig
+    deformation: DeformationConfig = dataclasses.field(
+        default_factory=lambda: DeformationConfig(enabled_regions=())
+    )
+    velocity_kappa_bounds: tuple[float, float] | None = None
     store_path: Path | None = None
     neu_dir: Path | None = None
     api_max_points: int | None = None
@@ -117,6 +218,24 @@ class AnalysisConfig:
         """Trajectory model name for one station (override or default)."""
         return self.detrend_overrides.get(marker, self.detrend_model)
 
+    def velocity_method_for(self, region_name: str) -> str:
+        """Velocity estimator for one region (override or default).
+
+        Raises:
+            ValueError: When the resolved method is not implemented
+                (Amendment A5: ``wls`` baseline, ``mle`` per region;
+                ``gbis`` velocities are a later slice).
+        """
+        region = self.region(region_name)
+        method = region.velocity_method or self.velocity_method
+        if method not in VELOCITY_METHODS:
+            raise ValueError(
+                f"region {region_name!r}: velocity method {method!r} is not "
+                f"implemented — configure one of {VELOCITY_METHODS} "
+                "('gbis' velocities are a later slice)"
+            )
+        return method
+
 
 def _as_mapping(value: object, what: str) -> dict[str, Any]:
     """Narrow a YAML node to a mapping (empty mapping when absent)."""
@@ -125,6 +244,17 @@ def _as_mapping(value: object, what: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"analysis.yaml: {what} must be a mapping, got {value!r}")
     return value
+
+
+def _as_pair(value: object, what: str) -> tuple[float, float] | None:
+    """Narrow a YAML node to a (lower, upper) float pair (None when absent)."""
+    if value is None:
+        return None
+    if not isinstance(value, list | tuple) or len(value) != 2:
+        raise ValueError(
+            f"analysis.yaml: {what} must be a [lower, upper] pair, got {value!r}"
+        )
+    return float(value[0]), float(value[1])
 
 
 def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
@@ -166,11 +296,17 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
             stations=stations,
             reference_frame=str(body.get("default_reference_frame", "ITRF2014")),
             description=(str(body["description"]) if body.get("description") else None),
+            velocity_method=(
+                str(body["velocity_method"]) if body.get("velocity_method") else None
+            ),
         )
 
     velocity = _as_mapping(raw.get("velocity"), "velocity")
     detrend = _as_mapping(raw.get("detrend"), "detrend")
     breaks = _as_mapping(raw.get("breakpoints"), "breakpoints")
+    deformation = _as_mapping(raw.get("deformation"), "deformation")
+    bayes = _as_mapping(deformation.get("bayes"), "deformation.bayes")
+    origin = _as_mapping(deformation.get("origin"), "deformation.origin")
     store = _as_mapping(raw.get("store"), "store")
     data = _as_mapping(raw.get("data"), "data")
     api = _as_mapping(raw.get("api"), "api")
@@ -204,6 +340,40 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
                 if breaks.get("max_workers") is not None
                 else None
             ),
+        ),
+        # Mogi deformation stage (Amendment A6): absent block → disabled.
+        deformation=DeformationConfig(
+            enabled_regions=tuple(
+                str(r) for r in deformation.get("enabled_regions") or ()
+            ),
+            source=str(deformation.get("source", "mogi")),
+            series=str(deformation.get("series", "raw")),
+            window_years=float(deformation.get("window_years", 1.0)),
+            step_days=float(deformation.get("step_days", 7.0)),
+            epoch_mean_days=float(deformation.get("epoch_mean_days", 10.0)),
+            min_stations=int(deformation.get("min_stations", 3)),
+            nu=float(deformation.get("nu", 0.25)),
+            depth_bounds_km=(
+                _as_pair(
+                    deformation.get("depth_bounds_km"), "deformation.depth_bounds_km"
+                )
+                or (0.1, 20.0)
+            ),
+            dv_bounds_m3=_as_pair(
+                deformation.get("dv_bounds_m3"), "deformation.dv_bounds_m3"
+            ),
+            origin_lon=(
+                float(origin["lon"]) if origin.get("lon") is not None else None
+            ),
+            origin_lat=(
+                float(origin["lat"]) if origin.get("lat") is not None else None
+            ),
+            bayes_n_runs=int(bayes.get("n_runs", 0)),
+            bayes_t_runs=int(bayes.get("t_runs", 100)),
+        ),
+        # Optional κ search bounds for method="mle" regions (Amendment A5).
+        velocity_kappa_bounds=_as_pair(
+            velocity.get("kappa_bounds"), "velocity.kappa_bounds"
         ),
         store_path=Path(str(store["path"])).expanduser() if store.get("path") else None,
         neu_dir=(

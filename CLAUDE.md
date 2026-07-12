@@ -19,14 +19,17 @@ Consumers: thin Dash QC tool (Phase 1), aflogun SPA (Phase 4), gps_plot.
   (on-demand, `max_points`/LTTB); complex selections via `POST /v1/query`;
   typed versioned `/v1/layers`. Data endpoints live under `/v1` (`/healthz`
   unversioned); fully public read, no auth, QC products stay out.
-- **Store-wired** (fleet slice, 2026-07-11): `/v1/stations`,
-  `/v1/stations/{marker}/series` (LTTB via `downsample.py`; `api.max_points`
-  from the run meta is default + clamp — contract Amendment A3),
-  `/v1/velocities`, `/v1/models/{region}` (`kind="breakpoints"`, GBIS4TS).
+- **Store-wired** (fleet slice 2026-07-11; Mogi/MLE slice 2026-07-12):
+  `/v1/stations`, `/v1/stations/{marker}/series` (LTTB via `downsample.py`;
+  `api.max_points` from the run meta is default + clamp — contract
+  Amendment A3), `/v1/velocities`, `/v1/models/{region}`
+  (`kind="breakpoints"`, GBIS4TS), `/v1/deformation/{region}` (Mogi ΔV(t)
+  time series + optional Bayesian posterior — Amendment A6).
   Still **501 stubs**: `/models/{region}/history` (reserved, Decisions #5),
   `/layers`, `/query` — keep the `not_implemented()` helper pattern so
-  error shape stays uniform. `method` values: `wls | gbis` (`mle` reserved);
-  see the contract's Amendments A1–A4.
+  error shape stays uniform. Velocity `method` values: `wls | mle` live
+  (`mle` per-region via `velocity_method`, honest colored-noise σ + `noise`
+  provenance — Amendment A5), `gbis` reserved; see Amendments A1–A6.
 
 ## Precompute job (decision: lives here, `gps_api.precompute`)
 
@@ -57,6 +60,20 @@ station is skipped inside its region, a bad region is skipped by the fleet.
 GBIS4TS stays gated by `breakpoints.enabled_regions` — WLS is the
 fleet-wide baseline; never run the 1e6 chains across all stations.
 
+**Mogi deformation + MLE velocity** (2026-07-12, Amendments A5/A6): the
+job now runs `gps_analysis.estimate_velocity_mle` for regions configuring
+`velocity_method: mle` (WLS stays the fleet baseline) and, for regions in
+`deformation.enabled_regions` (gated like breakpoints), the Mogi stage
+(`precompute/deformation.py`): per grid epoch, station displacements
+relative to the trailing-window start → `mogi_invert` in a local
+tangent-plane frame → `models/<region>_deformation.json` (ΔV(t)/depth/
+position + σ; optional `mogi_invert_bayes` posterior for the newest epoch
+when `deformation.bayes.n_runs > 0`). A stage failure is recorded
+(`deformation_failed` in `meta/run.json`) without sinking the region. The
+product is an **independent GNSS-only** analog of Vincent's operational
+Mogi ΔV(t) (`insar.vedur.is:.../inv_volume_mogi.dat`) — cross-checked
+against his, never derived from his files. CLI: `--no-deformation`.
+
 **Parallel breaks + triage** (`precompute/breaks.py`, perf-audit #1/#6 +
 plan §10.7): the gated GBIS4TS chains fan out over a
 `ProcessPoolExecutor` (spawn; workers return 256-byte scalar
@@ -74,11 +91,12 @@ identical summaries to the old serial path (tests pin exact equality).
 
 ```
 src/gps_api/{main.py, schemas.py, settings.py, downsample.py,
-             routers/{stations,velocities,models,layers,query}.py,
-             precompute/{config,sources,products,job}.py}
+             routers/{stations,velocities,models,deformation,layers,query}.py,
+             precompute/{config,sources,products,job,breaks,deformation}.py}
 tests/test_app.py         # contract-shape tests (routes, 404/501+detail, OpenAPI)
 tests/test_precompute.py  # end-to-end: config → precompute (region + fleet) → store → wired endpoints
 tests/test_breaks_parallel.py  # pool==serial parity, triage flags, bounded summaries, fault tolerance
+tests/test_deformation.py # Mogi ΔV(t) recovery + MLE velocities + gating + endpoint + fault tolerance
 tests/test_downsample.py  # LTTB property tests + single-channel reference parity
 ```
 
@@ -101,6 +119,7 @@ uv run mypy src tests && uv run pytest
   those imports are allowed.
 
 ---
-*Last reviewed: 2026-07-12 (fleet-parallel-mcmc: pooled GBIS4TS chains +
-triage→confirm; prior review 2026-07-11 fleet rollout — stations/series/models
-endpoints, LTTB, contract Amendments A1–A4)*
+*Last reviewed: 2026-07-12 (productize-mogi-mle: Mogi ΔV(t) deformation
+products + `/v1/deformation/{region}` + per-region MLE velocities,
+Amendments A5–A6; same day: fleet-parallel-mcmc pooled GBIS4TS chains +
+triage→confirm; prior review 2026-07-11 fleet rollout, Amendments A1–A4)*

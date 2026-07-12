@@ -4,7 +4,8 @@ What these tests pin down is the *contract*: every route exists, every
 error is ``{"detail": …}``, and the OpenAPI document describes the full
 surface in docs/API_CONTRACT.md. The store-wired endpoints
 (``/v1/stations``, ``/v1/stations/{marker}/series``, ``/v1/velocities``,
-``/v1/models/{region}``) answer contract-shaped 404s on an empty store;
+``/v1/models/{region}``, ``/v1/deformation/{region}``) answer
+contract-shaped 404s on an empty store;
 the reserved endpoints (``/v1/models/{region}/history``, ``/v1/layers``,
 ``/v1/query``) stay deliberate 501 stubs.
 """
@@ -29,6 +30,7 @@ WIRED_EMPTY_STORE_404_ROUTES = [
     "/v1/stations/SENG/series",
     "/v1/velocities",
     "/v1/models/reykjanes",
+    "/v1/deformation/reykjanes",
 ]
 
 CONTRACT_PATHS = [
@@ -38,6 +40,7 @@ CONTRACT_PATHS = [
     "/v1/velocities",
     "/v1/models/{region}",
     "/v1/models/{region}/history",
+    "/v1/deformation/{region}",
     "/v1/layers",
     "/v1/query",
 ]
@@ -104,6 +107,12 @@ def test_series_rejects_pathy_marker() -> None:
 
 def test_models_rejects_pathy_region() -> None:
     resp = client.get("/v1/models/bad!region")
+    assert resp.status_code == 422
+    assert "detail" in resp.json()
+
+
+def test_deformation_rejects_pathy_region() -> None:
+    resp = client.get("/v1/deformation/bad!region")
     assert resp.status_code == 422
     assert "detail" in resp.json()
 
