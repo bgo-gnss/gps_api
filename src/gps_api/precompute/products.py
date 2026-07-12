@@ -7,6 +7,7 @@ Layout under the store root (:func:`gps_api.settings.store_path`)::
     series/<MARKER>.parquet          raw + detrended N/E/U series (bulk)
     models/<region>_breaks.json      GBIS4TS break/rate-change catalog
     models/<region>_deformation.json Mogi ΔV(t) source time series (A6)
+    models/<region>_slip.json        Okada distributed-slip distribution (A7)
     meta/run.json                    provenance summary of the last run
 
 Contract mapping (``docs/API_CONTRACT.md`` / :mod:`gps_api.schemas`):
@@ -45,7 +46,12 @@ import pyarrow.parquet as pq
 
 from gps_api import __version__, settings
 from gps_api.precompute.sources import COMPONENTS, FloatArray, StationSeries
-from gps_api.schemas import DeformationResult, StationCollection, VelocityCollection
+from gps_api.schemas import (
+    DeformationResult,
+    SlipDistributionResult,
+    StationCollection,
+    VelocityCollection,
+)
 
 # Re-exported from settings (the shared writer/reader vocabulary) so the
 # series router can read it without importing this gps_analysis-dependent
@@ -102,6 +108,11 @@ def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return path
+
+
+def _unlink_if_exists(path: Path) -> None:
+    """Remove a stale sibling product (store hygiene; missing_ok)."""
+    path.unlink(missing_ok=True)
 
 
 def write_stations_geojson(
@@ -190,12 +201,42 @@ def write_deformation_json(
     ``GET /v1/deformation/{region}``. The structured provenance is stamped
     into the payload's ``provenance`` member (a schema field here, unlike
     the GeoJSON foreign member of the velocity products).
+
+    A region configures ``source: mogi`` XOR ``source: okada``; the endpoint
+    serves whichever product file is present, so any stale Okada sibling from
+    a previous ``source: okada`` run is removed here (store hygiene — a flipped
+    source must never leave a shadowing product behind).
     """
     payload = result.model_dump(mode="json")
     payload["provenance"] = provenance.as_dict()
+    _unlink_if_exists(store / settings.MODELS_DIR / f"{region}_slip.json")
     return _write_json(
         store / settings.MODELS_DIR / f"{region}_deformation.json", payload
     )
+
+
+def write_slip_json(
+    store: Path,
+    region: str,
+    result: SlipDistributionResult,
+    provenance: Provenance,
+) -> Path:
+    """Write one region's Okada distributed-slip product (Amendment A7).
+
+    Validated :class:`~gps_api.schemas.SlipDistributionResult` (built by
+    :func:`gps_api.precompute.slip.compute_slip_distribution`), served by
+    ``GET /v1/deformation/{region}`` alongside the Mogi product (discriminated
+    by ``source_type``). The structured provenance is stamped into the
+    payload's ``provenance`` member (a schema field, like the Mogi product).
+
+    Any stale Mogi sibling from a previous ``source: mogi`` run is removed
+    here — the endpoint serves whichever product file is present, so a flipped
+    source must not leave a shadowing product behind (store hygiene).
+    """
+    payload = result.model_dump(mode="json")
+    payload["provenance"] = provenance.as_dict()
+    _unlink_if_exists(store / settings.MODELS_DIR / f"{region}_deformation.json")
+    return _write_json(store / settings.MODELS_DIR / f"{region}_slip.json", payload)
 
 
 def write_run_meta(store: Path, summary: dict[str, Any]) -> Path:

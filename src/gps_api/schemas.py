@@ -11,7 +11,7 @@ Conventions (skjalftalisa lessons, plan §10.5):
 """
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -286,7 +286,8 @@ class DeformationResult(BaseModel):
 
     region: str
     source_type: Literal["mogi"] = Field(
-        description="deformation source model ('okada' and 'joint' reserved)"
+        description="deformation source model ('okada' is the parallel "
+        "distributed-slip product; 'joint' reserved)"
     )
     reference_time: datetime = Field(
         description="epoch displacements are referenced to (ΔV = 0 by construction)"
@@ -318,6 +319,127 @@ class DeformationResult(BaseModel):
             "fitted_at, input source, run settings (structured)"
         ),
     )
+
+
+class FaultPatch(BaseModel):
+    """One patch of a discretized fault/dike plane with its estimated slip.
+
+    The plane is tiled row-major (:func:`gps_analysis.discretize_fault`):
+    ``index = row·n_strike + col``, ``row`` down-dip (0 = shallowest),
+    ``col`` along strike. Position is served geographically (patch-centroid
+    lon/lat, WGS84) and in the local tangent-plane frame (east/north metres
+    from the product origin). ``slip_m``/``sigma_m`` are keyed by slip
+    component (``opening``/``strike_slip``/``dip_slip``); ``sigma_m`` is the
+    unconstrained linear-Gaussian formal 1-σ (see
+    :class:`SlipDistributionResult` — not exact for patches pinned by the
+    non-negativity constraint).
+    """
+
+    index: int = Field(description="row-major patch index k = row·n_strike + col")
+    row: int = Field(description="down-dip row j (0 = shallowest)")
+    col: int = Field(description="along-strike column i")
+    lon: float = Field(description="patch-centroid longitude, degrees East (WGS84)")
+    lat: float = Field(description="patch-centroid latitude, degrees North (WGS84)")
+    east_m: float = Field(description="patch-centroid east offset from origin, m")
+    north_m: float = Field(description="patch-centroid north offset from origin, m")
+    depth_km: float = Field(description="patch-centroid depth below surface, km")
+    slip_m: dict[str, float] = Field(
+        description="estimated slip/opening per component, m (+ = opening/reverse)"
+    )
+    sigma_m: dict[str, float] = Field(
+        description="formal 1-σ of the slip per component, m (linear-Gaussian)"
+    )
+
+
+class SlipDistributionResult(BaseModel):
+    """GET /v1/deformation/{region} — Okada distributed-slip product (A7).
+
+    A single-window GPS-only distributed-slip inversion on an
+    **operator-supplied fixed plane** (dikes/faults are event-specific): the
+    net displacement over the trailing window is inverted for smoothed
+    slip/opening per patch (``gps_analysis.okada_invert_slip``,
+    Laplacian-regularized ± non-negative). Served from the same endpoint as
+    the Mogi :class:`DeformationResult`, discriminated by ``source_type`` — a
+    region configures ``source: mogi`` XOR ``source: okada``, so exactly one
+    product exists per region.
+
+    ``sigma_m``/``sigma_potency_m3`` are the unconstrained linear-Gaussian
+    formal covariance propagated through the (public) Green's/Laplacian
+    operators; under ``nonnegative`` they are **not exact** for patches
+    pinned at the ``slip ≥ 0`` bound (the provenance records this).
+    """
+
+    region: str
+    source_type: Literal["okada"] = Field(
+        description="deformation source model ('mogi' is the parallel product)"
+    )
+    reference_time: datetime = Field(
+        description="window-start epoch the net displacement is referenced to"
+    )
+    target_time: datetime = Field(
+        description="window-end epoch the net displacement is measured at"
+    )
+    origin_lon: float = Field(
+        description="local frame origin = plane centroid longitude, degrees East"
+    )
+    origin_lat: float = Field(
+        description="local frame origin = plane centroid latitude, degrees North"
+    )
+    series_kind: Literal["raw", "detrended"] = Field(
+        description="which station series fed the inversion (deformation.series)"
+    )
+    strike: float = Field(description="plane strike azimuth, degrees CW from north")
+    dip: float = Field(description="plane dip, degrees down from horizontal")
+    length_km: float = Field(description="plane along-strike length, km")
+    width_km: float = Field(description="plane down-dip width, km")
+    top_depth_km: float = Field(description="plane up-dip (shallow) edge depth, km")
+    n_strike: int = Field(description="patches along strike")
+    n_dip: int = Field(description="patches down dip")
+    components: list[str] = Field(description="estimated slip directions")
+    nonnegative: bool = Field(description="whether slip ≥ 0 was imposed (NNLS)")
+    smoothing: float = Field(description="Laplacian regularization weight λ used")
+    smoothing_selected_by: Literal["fixed", "lcurve"] = Field(
+        description="'fixed' = configured λ; 'lcurve' = L-curve corner selection"
+    )
+    edge: Literal["zero", "free"] = Field(
+        description="Laplacian boundary treatment (patch_laplacian)"
+    )
+    stations: list[str] = Field(
+        description="markers whose net displacements entered the inversion"
+    )
+    patches: list[FaultPatch] = Field(
+        description="the slip grid, row-major (ascending index)"
+    )
+    potency_m3: dict[str, float] = Field(
+        description="geometric potency Σ slip·area per component, m³ (dike volume)"
+    )
+    sigma_potency_m3: dict[str, float] = Field(
+        description="formal 1-σ of the potency per component, m³"
+    )
+    residual_norm: float = Field(description="σ-weighted misfit norm ‖(d−Gs)/σ‖₂")
+    roughness_norm: float = Field(description="Laplacian roughness norm ‖L∇·s‖₂")
+    rms_mm: float = Field(description="unweighted residual RMS, mm")
+    n_obs: int = Field(
+        description="scalar observations entering the fit (3 × stations)"
+    )
+    n_stations: int = Field(description="stations entering the fit")
+    fitted_at: datetime
+    provenance: str | dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "product provenance: method tag, frame, software versions, "
+            "fitted_at, input source, plane + regularization settings"
+        ),
+    )
+
+
+#: Discriminated union served by ``GET /v1/deformation/{region}`` — the Mogi
+#: ΔV(t) product (``source_type="mogi"``) or the Okada distributed-slip
+#: product (``source_type="okada"``); a region configures exactly one source.
+DeformationProduct = Annotated[
+    DeformationResult | SlipDistributionResult,
+    Field(discriminator="source_type"),
+]
 
 
 class Layer(BaseModel):

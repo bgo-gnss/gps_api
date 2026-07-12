@@ -52,7 +52,7 @@
 | GET | `/v1/velocities` | `VelocityCollection` (GeoJSON) | **wired** | `region`, `window_years` filters |
 | GET | `/v1/models/{region}` | `ModelResult` | **wired** | latest model products; `kind="breakpoints"` (GBIS4TS) first — see Amendment A2; the `"mogi"` kind stays reserved (the live Mogi product moved to `/v1/deformation`) |
 | GET | `/v1/models/{region}/history` | `ModelHistory` | 501 | fit time-lapse; reserved in v0 (Decisions #5), needs run accumulation (Postgres slice) |
-| GET | `/v1/deformation/{region}` | `DeformationResult` | **wired** | Mogi source ΔV(t)/depth/position time series + optional Bayesian posterior — see Amendment A6 |
+| GET | `/v1/deformation/{region}` | `DeformationResult` \| `SlipDistributionResult` | **wired** | Mogi source ΔV(t) time series (A6) **or** Okada distributed-slip distribution (A7), discriminated by `source_type` (`mogi`/`okada`); a region configures exactly one source |
 | GET | `/v1/layers` | `LayerCatalog` | 501 | typed, versioned overlay catalog |
 | POST | `/v1/query` | `QueryResponse` | 501 | complex selections via JSON body |
 
@@ -186,8 +186,41 @@ changed in the same commit (the two are always changed together).
   other; ours is never derived from his files. (This also pre-stages the
   Decisions #5 history reconciliation.)
 
+## Amendments (Okada distributed-slip productization, 2026-07-12)
+
+Additive change landed with the `productize-okada-slip` slice; `schemas.py`
+changed in the same commit (the two are always changed together).
+
+- **A7 — `GET /v1/deformation/{region}`: the Okada distributed-slip
+  product.** A region may configure `deformation.source: okada` with an
+  operator-supplied fault/dike plane (the `deformation.okada` block).
+  **Distributed slip fixes the plane and inverts slip on it — the plane is
+  NOT auto-found** (dikes are event-specific; the operator supplies the
+  geometry per intrusion, config-driven). The gated stage inverts a
+  **single-window** slip distribution: the net displacement over the trailing
+  `window_years` window (window-end − window-start means, local plane-centroid
+  frame) is inverted for smoothed slip/opening on the fixed plane
+  (`gps_analysis.discretize_fault` → `okada_greens` → `okada_invert_slip`,
+  Laplacian-regularized ± non-negative; λ fixed or the `slip_lcurve` corner).
+  It writes `models/<region>_slip.json` — a `SlipDistributionResult`: the
+  plane geometry + discretization, per-`FaultPatch` slip/opening and formal σ
+  (lon/lat + local east/north + depth), per-component potency Σ slip·area
+  (+ σ), the λ used and how it was selected, and the misfit/roughness norms +
+  RMS. The endpoint serves it as a discriminated union with the Mogi
+  `DeformationResult` (`source_type` = `mogi`/`okada`); a region configures
+  exactly one source, so exactly one product file exists. Config keys under
+  `deformation`: `source: okada` + `okada.{origin.{lon,lat}, strike, dip,
+  length_km, width_km, top_depth_km, n_strike, n_dip, components, smoothing
+  (float or omit/`lcurve`), smoothing_scan, nonneg, edge}`. A stage failure
+  (too few stations, degenerate/all-pinned solution) is recorded in
+  `meta/run.json` (`deformation_failed`) without sinking the region's other
+  products. **Formal σ caveat:** the per-patch/potency σ is the *unconstrained*
+  linear-Gaussian formal covariance propagated through the public
+  Green's/Laplacian operators — not exact for patches pinned by the
+  non-negativity constraint (the provenance says so).
+
 ---
 
 *Drafted + reviewed 2026-07-08 (Phase 0). Amended 2026-07-11 (fleet slice:
-endpoint statuses, A1–A4); 2026-07-12 (Mogi + MLE productization, A5–A6).
-Owner: BGÓ.*
+endpoint statuses, A1–A4); 2026-07-12 (Mogi + MLE productization, A5–A6;
+Okada distributed-slip productization, A7). Owner: BGÓ.*

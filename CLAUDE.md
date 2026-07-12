@@ -24,7 +24,8 @@ Consumers: thin Dash QC tool (Phase 1), aflogun SPA (Phase 4), gps_plot.
   `api.max_points` from the run meta is default + clamp — contract
   Amendment A3), `/v1/velocities`, `/v1/models/{region}`
   (`kind="breakpoints"`, GBIS4TS), `/v1/deformation/{region}` (Mogi ΔV(t)
-  time series + optional Bayesian posterior — Amendment A6).
+  time series + Bayesian posterior — A6; **or** Okada distributed-slip
+  distribution — A7; `source_type`-discriminated union, one source/region).
   Still **501 stubs**: `/models/{region}/history` (reserved, Decisions #5),
   `/layers`, `/query` — keep the `not_implemented()` helper pattern so
   error shape stays uniform. Velocity `method` values: `wls | mle` live
@@ -71,20 +72,29 @@ position + σ; optional `mogi_invert_bayes` posterior for the newest epoch
 when `deformation.bayes.n_runs > 0`). A stage failure is recorded
 (`deformation_failed` in `meta/run.json`) without sinking the region. The
 product is an **independent GNSS-only** analog of Vincent's operational
-Mogi ΔV(t) (`insar.vedur.is:.../inv_volume_mogi.dat`) — cross-checked
-against his, never derived from his files. CLI: `--no-deformation`.
-Per-epoch fits are multi-start (warm + cold) with bound-pinned optima
-rejected (`_invert_epoch`/`_is_interior`) — real-data robustness fix
-2026-07-12, see `docs/VALIDATION_svartsengi_deformation.md`.
+Mogi ΔV(t) (`insar.vedur.is:.../inv_volume_mogi.dat`) — cross-checked, never
+derived. CLI: `--no-deformation`. Per-epoch fits are multi-start (warm+cold)
+with bound-pinned optima rejected (`_invert_epoch`/`_is_interior`) —
+real-data robustness fix.
+
+**Okada distributed slip** (2026-07-12, Amendment A7, `precompute/slip.py`):
+`deformation.source: okada` inverts a **single-window** slip distribution on
+an **operator-supplied fixed plane** (`deformation.okada` → `OkadaPlaneConfig`;
+config-driven per intrusion, NOT auto-found). Net window displacement →
+`discretize_fault`→`okada_greens`→`okada_invert_slip` (Laplacian-reg ± NNLS;
+λ fixed or `slip_lcurve` corner) → `models/<region>_slip.json`
+(`SlipDistributionResult`: per-`FaultPatch` slip/σ + potency + norms), served
+on the same `/v1/deformation/{region}` endpoint, `source_type`-discriminated
+from Mogi (mogi XOR okada). Per-patch σ = unconstrained linear-Gaussian formal
+cov via the public G/L operators (`_slip_formal_cov`; not exact for NNLS-pinned
+patches — provenance `sigma_note`). Degenerate solves → `deformation_failed`.
 
 **Real-data validation** (2026-07-12): `gps_api.validation.realdata` +
 `gps-api-validate-deformation` reconcile the pipeline on real Svartsengi
 `.NEU` (CDN) against the operational model (read-only SSH,
-`/mnt/scratch/vincent/model/svartsengi/` — file formats characterized in
-the module docstring). Baseline (inflation08): ΔV(t) r=0.993, final ratio
-0.85, free depth 3.7±1.0 km vs fixed 4.0, source 0.32 km off — verdict +
-numbers in `docs/VALIDATION_svartsengi_deformation.md`. Fixture
-`tests/fixtures/realdata/` is gitignored (`fetch` subcommand rebuilds);
+`/mnt/scratch/vincent/model/svartsengi/`). Baseline inflation08: ΔV(t)
+r=0.993, verdict + numbers in `docs/VALIDATION_svartsengi_deformation.md`.
+Fixture `tests/fixtures/realdata/` is gitignored (`fetch` rebuilds);
 `tests/test_validation_realdata.py` is skipped without it.
 
 **Parallel breaks + triage** (`precompute/breaks.py`, perf-audit #1/#6 +
@@ -95,22 +105,23 @@ chain). Optional triage→confirm: `breakpoints.triage_n_runs > 0` screens
 every gated station with a short chain and confirms only stations whose
 trend-change posterior `|mean|/std` ≥ `triage_sigma`; flagged/screened
 counts are logged and stamped into the breaks-product provenance (never a
-silent cap). Config keys: `triage_n_runs` (0 = off, default),
-`triage_t_runs`, `triage_sigma`, `max_workers` (absent → cpu count,
-0 = inline); CLI `--triage-runs/--triage-t-runs/--workers`. Same seed →
-identical summaries to the old serial path (tests pin exact equality).
+silent cap). Config keys `triage_n_runs` (0 = off) / `triage_t_runs` /
+`triage_sigma` / `max_workers` (absent → cpu count, 0 = inline); CLI
+`--triage-runs/--triage-t-runs/--workers`. Same seed → identical summaries
+to the old serial path (tests pin exact equality).
 
 ## Layout & commands
 
 ```
 src/gps_api/{main.py, schemas.py, settings.py, downsample.py,
              routers/{stations,velocities,models,deformation,layers,query}.py,
-             precompute/{config,sources,products,job,breaks,deformation}.py,
+             precompute/{config,sources,products,job,breaks,deformation,slip}.py,
              validation/realdata.py}  # real-data harness (precompute-side)
 tests/test_app.py         # contract-shape tests (routes, 404/501+detail, OpenAPI)
 tests/test_precompute.py  # end-to-end: config → precompute (region + fleet) → store → wired endpoints
 tests/test_breaks_parallel.py  # pool==serial parity, triage flags, bounded summaries, fault tolerance
 tests/test_deformation.py # Mogi ΔV(t) recovery + MLE velocities + gating + endpoint + fault tolerance
+tests/test_slip.py        # Okada distributed-slip recovery + σ faithfulness + L-curve + gating + endpoint + fault tolerance
 tests/test_downsample.py  # LTTB property tests + single-channel reference parity
 tests/test_validation_realdata.py  # env-gated real-data reconciliation (skipped w/o fixture)
 ```
@@ -134,8 +145,9 @@ uv run mypy src tests && uv run pytest
   those imports are allowed.
 
 ---
-*Last reviewed: 2026-07-12 (validate-deformation-realdata: real Svartsengi
-reconciliation vs the operational model + multi-start/interior-guard fix in
-the Mogi stage; same day: productize-mogi-mle Amendments A5–A6 and
-fleet-parallel-mcmc pooled GBIS4TS chains + triage→confirm; prior review
-2026-07-11 fleet rollout, Amendments A1–A4)*
+*Last reviewed: 2026-07-12 (productize-okada-slip: Okada distributed-slip
+stage `precompute/slip.py` + `SlipDistributionResult`/`FaultPatch` on the
+`source_type`-discriminated `/v1/deformation` endpoint — Amendment A7; same
+day: validate-deformation-realdata Svartsengi reconciliation + Mogi
+multi-start/interior-guard fix, productize-mogi-mle A5–A6, fleet-parallel-mcmc
+pooled GBIS4TS chains + triage→confirm; prior 2026-07-11 fleet rollout A1–A4)*
