@@ -6,6 +6,7 @@ Layout under the store root (:func:`gps_api.settings.store_path`)::
     velocities/<region>.geojson      VelocityCollection + provenance member
     series/<MARKER>.parquet          raw + detrended N/E/U series (bulk)
     models/<region>_breaks.json      GBIS4TS break/rate-change catalog
+    models/<region>_deformation.json Mogi ΔV(t) source time series (A6)
     meta/run.json                    provenance summary of the last run
 
 Contract mapping (``docs/API_CONTRACT.md`` / :mod:`gps_api.schemas`):
@@ -44,7 +45,7 @@ import pyarrow.parquet as pq
 
 from gps_api import __version__, settings
 from gps_api.precompute.sources import COMPONENTS, FloatArray, StationSeries
-from gps_api.schemas import StationCollection, VelocityCollection
+from gps_api.schemas import DeformationResult, StationCollection, VelocityCollection
 
 # Re-exported from settings (the shared writer/reader vocabulary) so the
 # series router can read it without importing this gps_analysis-dependent
@@ -174,6 +175,27 @@ def write_breaks_json(
         "entries": entries,
     }
     return _write_json(store / settings.MODELS_DIR / f"{region}_breaks.json", payload)
+
+
+def write_deformation_json(
+    store: Path,
+    region: str,
+    result: DeformationResult,
+    provenance: Provenance,
+) -> Path:
+    """Write one region's Mogi ΔV(t) deformation product (Amendment A6).
+
+    Validated :class:`~gps_api.schemas.DeformationResult` (built by
+    :func:`gps_api.precompute.deformation.compute_mogi_series`), served by
+    ``GET /v1/deformation/{region}``. The structured provenance is stamped
+    into the payload's ``provenance`` member (a schema field here, unlike
+    the GeoJSON foreign member of the velocity products).
+    """
+    payload = result.model_dump(mode="json")
+    payload["provenance"] = provenance.as_dict()
+    return _write_json(
+        store / settings.MODELS_DIR / f"{region}_deformation.json", payload
+    )
 
 
 def write_run_meta(store: Path, summary: dict[str, Any]) -> Path:

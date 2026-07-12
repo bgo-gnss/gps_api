@@ -50,8 +50,9 @@
 | GET | `/v1/stations` | `StationCollection` (GeoJSON) | **wired** | cacheable catalog; fleet runs span all regions, `properties.regions` merged |
 | GET | `/v1/stations/{marker}/series` | `SeriesResponse` | **wired** | `start`, `end`, `max_points` (target count, LTTB), `detrended` params; server-side ceiling — see Amendment A3 |
 | GET | `/v1/velocities` | `VelocityCollection` (GeoJSON) | **wired** | `region`, `window_years` filters |
-| GET | `/v1/models/{region}` | `ModelResult` | **wired** | latest model products; `kind="breakpoints"` (GBIS4TS) first — see Amendment A2; Mogi reserved |
+| GET | `/v1/models/{region}` | `ModelResult` | **wired** | latest model products; `kind="breakpoints"` (GBIS4TS) first — see Amendment A2; the `"mogi"` kind stays reserved (the live Mogi product moved to `/v1/deformation`) |
 | GET | `/v1/models/{region}/history` | `ModelHistory` | 501 | fit time-lapse; reserved in v0 (Decisions #5), needs run accumulation (Postgres slice) |
+| GET | `/v1/deformation/{region}` | `DeformationResult` | **wired** | Mogi source ΔV(t)/depth/position time series + optional Bayesian posterior — see Amendment A6 |
 | GET | `/v1/layers` | `LayerCatalog` | 501 | typed, versioned overlay catalog |
 | POST | `/v1/query` | `QueryResponse` | 501 | complex selections via JSON body |
 
@@ -147,7 +148,46 @@ changed in the same commit (the two are always changed together).
   (per-region + per-station success/failure counts). The API surface is
   unchanged — the same endpoints serve single-region and fleet stores.
 
+## Amendments (Mogi + MLE productization, 2026-07-12)
+
+Additive changes landed with the `productize-mogi-mle` slice; `schemas.py`
+changed in the same commit (the two are always changed together).
+
+- **A5 — velocity `method="mle"` goes live (per region).** A region may
+  configure `velocity_method: mle` in its `analysis.yaml` block (the global
+  `velocity.default_method` stays `wls` — the fleet-wide baseline). MLE
+  features carry honest colored-noise GLS `sigma_*` (typically several ×
+  the WLS formal error for flicker-dominated series) plus a `noise`
+  property: per-component `{sigma_white_mm, amplitude_mm, spectral_index}`
+  — the provenance that makes the σ honest. Optional
+  `velocity.kappa_bounds` bounds the spectral-index search and is echoed in
+  the product provenance. `method` values now: `"wls" | "mle"` live,
+  `"gbis"` reserved.
+- **A6 — `GET /v1/deformation/{region}`: the Mogi ΔV(t) product.** A new
+  precompute stage (gated by `deformation.enabled_regions`, exactly like
+  breakpoints) fits one Mogi source per grid epoch to the region's GNSS
+  displacement field (relative to the trailing-window start;
+  `gps_analysis.mogi_invert`, local tangent-plane frame) and writes
+  `models/<region>_deformation.json` — a `DeformationResult`: ascending
+  `fits` of `{time, lon, lat, east_m, north_m, depth_km, dv_m3, sigma_*,
+  chi2_reduced, rms_mm, n_stations}`, plus an optional Bayesian
+  `posterior` for the newest epoch (`gps_analysis.mogi_invert_bayes`,
+  percentile summaries `p2_5…p97_5` per parameter) when
+  `deformation.bayes.n_runs > 0`. Config keys: `source` (`mogi`; `okada`
+  reserved), `series` (`raw`/`detrended`), `window_years`, `step_days`,
+  `epoch_mean_days`, `min_stations`, `nu`, `depth_bounds_km`,
+  `dv_bounds_m3`, optional `origin.{lon,lat}`, `bayes.{n_runs,t_runs}`.
+  A stage failure is recorded in `meta/run.json`
+  (`deformation_failed`) without sinking the region's other products.
+  **Cross-check, not dependency:** this is an *independent GNSS-only*
+  analog of Vincent's operational Mogi ΔV(t)
+  (`insar.vedur.is:/mnt/scratch/vincent/model/svartsengi/inflation*/
+  inv_volume_mogi.dat`) — the two products are compared against each
+  other; ours is never derived from his files. (This also pre-stages the
+  Decisions #5 history reconciliation.)
+
 ---
 
 *Drafted + reviewed 2026-07-08 (Phase 0). Amended 2026-07-11 (fleet slice:
-endpoint statuses, A1–A4). Owner: BGÓ.*
+endpoint statuses, A1–A4); 2026-07-12 (Mogi + MLE productization, A5–A6).
+Owner: BGÓ.*

@@ -17,8 +17,12 @@ rule):
    trajectory fit per component, and :func:`gps_analysis.remove_trend` —
    the detrended series.
 2. :func:`gps_analysis.estimate_velocity` — fixed-window WLS secular
-   velocity with formal σ (``method="wls"``; the GBIS honest-σ upgrade is a
-   later slice, PLAN-analysis-lane §1).
+   velocity with formal σ (``method="wls"``, the fleet baseline) — or,
+   where the region configures ``velocity_method: mle`` (contract
+   Amendment A5), :func:`gps_analysis.estimate_velocity_mle` — the
+   colored-noise MLE with honest σ and per-component noise-model
+   provenance on the feature. The GBIS velocity upgrade stays a later
+   slice (PLAN-analysis-lane §1).
 3. :func:`gps_analysis.detect_breakpoints` — GBIS4TS velocity break points
    + colored-noise parameters (``method="gbis"``), per component. The
    displacement series is passed straight in — the estimator
@@ -31,6 +35,12 @@ rule):
    (:mod:`gps_api.precompute.breaks` — perf-audit #1/#6, plan §10.7):
    the cheap per-station stages (fit/detrend/velocity/Parquet) stay
    inline; only the MCMC work items are parallelized.
+
+4. :func:`gps_api.precompute.deformation.compute_mogi_series` — the Mogi
+   ΔV(t) deformation-source stage (Amendment A6), gated by
+   ``deformation.enabled_regions`` exactly like break detection. Its
+   product feeds ``GET /v1/deformation/{region}``; a stage failure is
+   recorded on the run summary without sinking the region.
 
 Products land in the file store (:mod:`gps_api.precompute.products`);
 ``GET /v1/velocities`` serves the velocity GeoJSON directly.
@@ -51,7 +61,10 @@ from typing import Any
 
 import numpy as np
 from gps_analysis import (
+    VelocityEstimate,
+    VelocityEstimateMLE,
     estimate_velocity,
+    estimate_velocity_mle,
     fit_components,
     linear,
     lineperiodic,
@@ -72,6 +85,7 @@ from gps_api.precompute.config import (
     load_analysis_config,
     load_station_meta,
 )
+from gps_api.precompute.deformation import compute_mogi_series
 from gps_api.precompute.products import Provenance
 from gps_api.precompute.sources import (
     COMPONENTS,
@@ -82,6 +96,7 @@ from gps_api.precompute.sources import (
     yearf_to_datetime,
 )
 from gps_api.schemas import (
+    ComponentNoise,
     PointGeometry,
     StationCollection,
     StationFeature,
@@ -116,6 +131,10 @@ class RunSummary:
     stations_failed: dict[str, str]
     products: tuple[str, ...]
     api_max_points: int | None = None
+    #: Region-level note when the (config-gated) Mogi deformation stage
+    #: failed — the region's other products survive (fault-tolerance rule),
+    #: but the failure is recorded, never silent.
+    deformation_failed: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-ready mapping for ``meta/run.json``."""
@@ -128,6 +147,8 @@ class RunSummary:
             "stations_failed": dict(self.stations_failed),
             "products": list(self.products),
         }
+        if self.deformation_failed is not None:
+            payload["deformation_failed"] = self.deformation_failed
         if self.api_max_points is not None:
             payload["api"] = {"max_points": self.api_max_points}
         return payload
@@ -160,6 +181,11 @@ class FleetSummary:
         """Stations recorded as failed, summed over successful regions."""
         return sum(len(s.stations_failed) for s in self.regions.values())
 
+    @property
+    def deformation_failed_total(self) -> int:
+        """Regions whose gated Mogi deformation stage failed."""
+        return sum(1 for s in self.regions.values() if s.deformation_failed is not None)
+
     def as_dict(self) -> dict[str, Any]:
         """JSON-ready mapping for ``meta/run.json`` (fleet shape)."""
         payload: dict[str, Any] = {
@@ -172,6 +198,11 @@ class FleetSummary:
                     "stations_ok": list(summary.stations_ok),
                     "stations_failed": dict(summary.stations_failed),
                     "products": list(summary.products),
+                    **(
+                        {"deformation_failed": summary.deformation_failed}
+                        if summary.deformation_failed is not None
+                        else {}
+                    ),
                 }
                 for name, summary in self.regions.items()
             },
@@ -202,17 +233,50 @@ def _velocity_feature(
     meta: StationMeta,
     cfg: AnalysisConfig,
     model_name: str,
+    method: str,
 ) -> VelocityFeature:
-    """WLS velocity vector for one station as a contract GeoJSON feature."""
+    """Velocity vector for one station as a contract GeoJSON feature.
+
+    ``method`` is the region's resolved estimator (Amendment A5): ``"wls"``
+    calls :func:`gps_analysis.estimate_velocity` (formal σ, the fleet
+    baseline); ``"mle"`` calls :func:`gps_analysis.estimate_velocity_mle`
+    (colored-noise GLS σ — honest for flicker-dominated series) and stamps
+    the per-component noise models onto the feature as provenance.
+    """
     t_last = float(series.t[-1])
-    estimate = estimate_velocity(
-        series.t,
-        series.y,
-        series.sigma,
-        model=model_name,
-        window=(t_last - cfg.velocity_window_years, None),
-        names=COMPONENTS,
-    )
+    window = (t_last - cfg.velocity_window_years, None)
+    noise: dict[str, ComponentNoise] | None = None
+    estimate: VelocityEstimate
+    if method == "mle":
+        mle_kwargs: dict[str, Any] = {}
+        if cfg.velocity_kappa_bounds is not None:
+            mle_kwargs["kappa_bounds"] = cfg.velocity_kappa_bounds
+        mle: VelocityEstimateMLE = estimate_velocity_mle(
+            series.t,
+            series.y,
+            model=model_name,
+            window=window,
+            names=COMPONENTS,
+            **mle_kwargs,
+        )
+        estimate = mle
+        noise = {
+            component: ComponentNoise(
+                sigma_white_mm=model.sigma_white,
+                amplitude_mm=model.amplitude_powerlaw,
+                spectral_index=model.spectral_index,
+            )
+            for component, model in zip(COMPONENTS, mle.noise, strict=True)
+        }
+    else:
+        estimate = estimate_velocity(
+            series.t,
+            series.y,
+            series.sigma,
+            model=model_name,
+            window=window,
+            names=COMPONENTS,
+        )
     if estimate.magnitude is None or estimate.azimuth is None:
         raise RuntimeError(
             f"{series.marker}: no horizontal magnitude/azimuth on the "
@@ -231,9 +295,10 @@ def _velocity_feature(
             sigma_up=float(estimate.sigmas[i_u]),
             magnitude=float(estimate.magnitude),
             azimuth=float(estimate.azimuth),
-            method="wls",
+            method="mle" if method == "mle" else "wls",
             window_start=yearf_to_datetime(estimate.span[0]),
             window_end=yearf_to_datetime(estimate.span[1]),
+            noise=noise,
         ),
     )
 
@@ -327,6 +392,7 @@ def run_precompute(
     source: str,
     *,
     detect_breaks: bool | None = None,
+    compute_deformation: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
     triage_n_runs: int | None = None,
@@ -347,6 +413,12 @@ def run_precompute(
         source: Provenance tag describing the data source for the run.
         detect_breaks: Force break detection on/off; ``None`` follows
             ``breakpoints.enabled_regions`` in the config.
+        compute_deformation: Force the Mogi deformation stage on/off;
+            ``None`` follows ``deformation.enabled_regions`` in the config
+            (Amendment A6 — gated exactly like break detection). A stage
+            failure is recorded on the summary
+            (:attr:`RunSummary.deformation_failed`) without sinking the
+            region's other products.
         n_runs / t_runs: Override the configured GBIS4TS confirm chain
             lengths (dev runs; production uses the configured 1e6).
         triage_n_runs / triage_t_runs: Override the configured triage
@@ -367,18 +439,20 @@ def run_precompute(
     Per-station failures are recorded and skipped — one bad station must
     not sink the batch (fault-tolerance rule of the ops packages).
     """
-    if cfg.velocity_method != "wls":
-        raise ValueError(
-            f"velocity.default_method={cfg.velocity_method!r} — only 'wls' is "
-            "implemented in this slice ('gbis' velocities are a later slice)"
-        )
     region = cfg.region(region_name)
+    # Resolved per-region estimator (Amendment A5) — raises on 'gbis'/typos.
+    velocity_method = cfg.velocity_method_for(region.name)
     meta = load_station_meta(region.stations)
     fitted_at = datetime.datetime.now(datetime.UTC)
     breaks_on = (
         cfg.breakpoints.enabled_for(region.name)
         if detect_breaks is None
         else detect_breaks
+    )
+    deformation_on = (
+        cfg.deformation.enabled_for(region.name)
+        if compute_deformation is None
+        else compute_deformation
     )
     runs = cfg.breakpoints.n_runs if n_runs is None else n_runs
     truns = cfg.breakpoints.t_runs if t_runs is None else t_runs
@@ -414,9 +488,14 @@ def run_precompute(
     break_entries: list[dict[str, Any]] = []
     break_tasks: dict[str, list[ComponentTask]] = {}
     triage_stats: TriageStats | None = None
+    # Kept only for deformation-gated regions (small, config-gated sets) —
+    # the Mogi stage needs the whole region's fields at once.
+    kept_series: dict[str, StationSeries] = {}
+    kept_detrended: dict[str, FloatArray] = {}
     written: list[str] = []
     ok: list[str] = []
     failed: dict[str, str] = {}
+    deformation_failed: str | None = None
 
     for marker in region.stations:
         model_name = cfg.detrend_model_for(marker)
@@ -454,9 +533,17 @@ def run_precompute(
                 )
             )
             velocity_features.append(
-                _velocity_feature(series, meta[marker], cfg, model_name)
+                _velocity_feature(
+                    series, meta[marker], cfg, model_name, velocity_method
+                )
             )
-            print(f"[{marker}] trajectory fit + WLS velocity done", flush=True)
+            print(
+                f"[{marker}] fit + {velocity_method.upper()} velocity done",
+                flush=True,
+            )
+            if deformation_on:
+                kept_series[marker] = series
+                kept_detrended[marker] = detrended
             if breaks_on:
                 # Chains are the fleet's cost — queue them for the pool
                 # instead of running the MCMC inline (perf-audit #1).
@@ -520,17 +607,19 @@ def run_precompute(
                 )
             )
         )
+    velocity_extra: dict[str, Any] = {
+        "model": cfg.detrend_model,
+        "window_years": cfg.velocity_window_years,
+    }
+    if velocity_method == "mle" and cfg.velocity_kappa_bounds is not None:
+        velocity_extra["kappa_bounds"] = list(cfg.velocity_kappa_bounds)
     written.append(
         str(
             products.write_velocities_geojson(
                 store,
                 region.name,
                 VelocityCollection(features=velocity_features),
-                _provenance(
-                    "wls",
-                    model=cfg.detrend_model,
-                    window_years=cfg.velocity_window_years,
-                ),
+                _provenance(velocity_method, **velocity_extra),
             )
         )
     )
@@ -562,6 +651,72 @@ def run_precompute(
             )
         )
 
+    if deformation_on:
+        # Mogi ΔV(t) stage (Amendment A6). Stations that failed anywhere in
+        # the chain are excluded; a stage failure is recorded — the region's
+        # velocity/series/break products stay in the store.
+        dcfg = cfg.deformation
+        try:
+            mogi_outcome = compute_mogi_series(
+                region.name,
+                {m: s for m, s in kept_series.items() if m in ok},
+                {m: d for m, d in kept_detrended.items() if m in ok},
+                meta,
+                dcfg,
+                fitted_at,
+                seed=seed,
+            )
+            deformation_extra: dict[str, Any] = {
+                "series": dcfg.series,
+                "window_years": dcfg.window_years,
+                "step_days": dcfg.step_days,
+                "epoch_mean_days": dcfg.epoch_mean_days,
+                "min_stations": dcfg.min_stations,
+                "nu": dcfg.nu,
+                "depth_bounds_km": list(dcfg.depth_bounds_km),
+                "dv_bounds_m3": (
+                    list(dcfg.dv_bounds_m3) if dcfg.dv_bounds_m3 is not None else None
+                ),
+                "epochs_skipped": mogi_outcome.epochs_skipped,
+                "stations_excluded": list(mogi_outcome.stations_excluded),
+                # Independent GNSS-only product — compared against, never
+                # derived from, Vincent's InSAR-side inv_volume_mogi.dat.
+                "cross_check": (
+                    "independent GNSS-only analog of the operational Mogi "
+                    "dV(t) at insar.vedur.is:/mnt/scratch/vincent/model/"
+                    "svartsengi/inflation*/inv_volume_mogi.dat"
+                ),
+            }
+            if dcfg.bayes_n_runs > 0:
+                deformation_extra["bayes"] = {
+                    "n_runs": dcfg.bayes_n_runs,
+                    "t_runs": dcfg.bayes_t_runs,
+                    "seed": seed,
+                }
+            written.append(
+                str(
+                    products.write_deformation_json(
+                        store,
+                        region.name,
+                        mogi_outcome.result,
+                        _provenance("mogi", **deformation_extra),
+                    )
+                )
+            )
+            print(
+                f"[region {region.name}] mogi deformation: "
+                f"{len(mogi_outcome.result.fits)} epoch(s) fitted, "
+                f"{mogi_outcome.epochs_skipped} skipped",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — stage must not sink the region
+            deformation_failed = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[region {region.name}] deformation FAILED: {deformation_failed}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     summary = RunSummary(
         region=region.name,
         store=store,
@@ -571,6 +726,7 @@ def run_precompute(
         stations_failed=failed,
         products=tuple(written),
         api_max_points=cfg.api_max_points,
+        deformation_failed=deformation_failed,
     )
     if write_meta:
         products.write_run_meta(store, summary.as_dict())
@@ -584,6 +740,7 @@ def run_fleet(
     source: str,
     *,
     detect_breaks: bool | None = None,
+    compute_deformation: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
     triage_n_runs: int | None = None,
@@ -600,9 +757,11 @@ def run_fleet(
       regions; a station configured in several regions carries them all in
       ``properties.regions`` (sorted). Stations of a *failed* region are
       not cataloged (their products were not produced this run).
-    - ``velocities/<region>.geojson`` / ``models/<region>_breaks.json`` —
-      written per region by :func:`run_precompute`; break detection stays
-      gated by ``breakpoints.enabled_regions`` (``detect_breaks=None``).
+    - ``velocities/<region>.geojson`` / ``models/<region>_breaks.json`` /
+      ``models/<region>_deformation.json`` — written per region by
+      :func:`run_precompute`; break detection stays gated by
+      ``breakpoints.enabled_regions`` and the Mogi deformation stage by
+      ``deformation.enabled_regions`` (both ``None`` overrides).
     - ``meta/run.json`` — a single :class:`FleetSummary` with per-region
       and per-station success/failure counts.
 
@@ -617,9 +776,9 @@ def run_fleet(
         series_loader: ``marker -> StationSeries`` shared by all regions.
         store: Store root directory (created as needed).
         source: Provenance tag describing the data source for the run.
-        detect_breaks / n_runs / t_runs / triage_n_runs / triage_t_runs /
-            max_workers / seed: Passed through to :func:`run_precompute`
-            (same semantics).
+        detect_breaks / compute_deformation / n_runs / t_runs /
+            triage_n_runs / triage_t_runs / max_workers / seed: Passed
+            through to :func:`run_precompute` (same semantics).
 
     Raises:
         RuntimeError: When every configured region failed.
@@ -639,6 +798,7 @@ def run_fleet(
                 store,
                 source,
                 detect_breaks=detect_breaks,
+                compute_deformation=compute_deformation,
                 n_runs=n_runs,
                 t_runs=t_runs,
                 triage_n_runs=triage_n_runs,
@@ -742,10 +902,12 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="gps-api-precompute",
         description=(
             "Scheduled precompute for the GNSS analysis lane: runs the "
-            "gps_analysis chain (trajectory fit + detrend, WLS velocity, "
-            "GBIS4TS break points for gated regions) for one configured "
+            "gps_analysis chain (trajectory fit + detrend, WLS or "
+            "colored-noise MLE velocity, GBIS4TS break points and Mogi "
+            "deformation sources for gated regions) for one configured "
             "region — or, with --fleet, every configured region — and "
-            "writes Parquet/GeoJSON products to the store gps_api serves."
+            "writes Parquet/GeoJSON/JSON products to the store gps_api "
+            "serves."
         ),
     )
     parser.add_argument(
@@ -830,6 +992,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip GBIS4TS break detection (velocities + series only)",
     )
+    parser.add_argument(
+        "--no-deformation",
+        action="store_true",
+        help="skip the Mogi deformation stage (otherwise gated by "
+        "deformation.enabled_regions in analysis.yaml)",
+    )
     return parser
 
 
@@ -862,6 +1030,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             store,
             source,
             detect_breaks=False if args.no_breakpoints else None,
+            compute_deformation=False if args.no_deformation else None,
             n_runs=args.runs,
             t_runs=args.t_runs,
             triage_n_runs=args.triage_runs,
@@ -874,11 +1043,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{len(fleet.regions_failed)} failed; "
             f"{fleet.stations_ok_total} station(s) ok, "
             f"{fleet.stations_failed_total} failed; "
+            f"{fleet.deformation_failed_total} deformation stage(s) failed; "
             f"{len(fleet.products)} product file(s) under {fleet.store}"
         )
         for name, reason in fleet.regions_failed.items():
             print(f"  region {name} FAILED — {reason}", file=sys.stderr)
-        clean = not fleet.regions_failed and fleet.stations_failed_total == 0
+        clean = (
+            not fleet.regions_failed
+            and fleet.stations_failed_total == 0
+            and fleet.deformation_failed_total == 0
+        )
         return 0 if clean else 1
 
     region_name = args.region or next(iter(cfg.regions))
@@ -889,6 +1063,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         store,
         source,
         detect_breaks=False if args.no_breakpoints else None,
+        compute_deformation=False if args.no_deformation else None,
         n_runs=args.runs,
         t_runs=args.t_runs,
         triage_n_runs=args.triage_runs,
@@ -903,7 +1078,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     for path in summary.products:
         print(f"  {path}")
-    return 0 if not summary.stations_failed else 1
+    clean = not summary.stations_failed and summary.deformation_failed is None
+    return 0 if clean else 1
 
 
 if __name__ == "__main__":
