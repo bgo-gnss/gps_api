@@ -6,8 +6,8 @@ from fastapi import HTTPException
 
 
 def not_implemented(what: str) -> NoReturn:
-    """Single 501 stub used by every endpoint until Phase 1 wires the store."""
+    """Single 501 stub for the not-yet-wired endpoints (uniform error shape)."""
     raise HTTPException(
         status_code=501,
-        detail=f"{what} is not implemented yet — Phase 1 wires this endpoint to the store.",
+        detail=f"{what} is not implemented yet — a later slice wires this endpoint to the store.",
     )

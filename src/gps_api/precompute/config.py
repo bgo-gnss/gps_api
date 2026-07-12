@@ -7,7 +7,7 @@ which ``gps_parser.ConfigParser`` resolves (``$GPS_CONFIG_PATH`` or
 
 - ``analysis.yaml`` — the analysis-lane sidecar (regions, velocity window +
   method, detrend model + overrides, break-point settings, optional
-  ``store.path`` / ``data.neu_dir``). Template:
+  ``store.path`` / ``data.neu_dir`` / ``api.max_points``). Template:
   ``gpslibrary/config-templates/analysis-lane/analysis.yaml``; it deploys
   through ``gps-config-data`` like every other cfg.
 - ``stations.cfg`` — station coordinates (``latitude``/``longitude``/
@@ -84,6 +84,7 @@ class AnalysisConfig:
     breakpoints: BreakpointConfig
     store_path: Path | None = None
     neu_dir: Path | None = None
+    api_max_points: int | None = None
 
     def region(self, name: str) -> RegionConfig:
         """Return one region or raise with the configured alternatives."""
@@ -156,6 +157,7 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
     breaks = _as_mapping(raw.get("breakpoints"), "breakpoints")
     store = _as_mapping(raw.get("store"), "store")
     data = _as_mapping(raw.get("data"), "data")
+    api = _as_mapping(raw.get("api"), "api")
 
     overrides_raw = _as_mapping(detrend.get("overrides"), "detrend.overrides")
     overrides: dict[str, str] = {}
@@ -180,6 +182,11 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
         store_path=Path(str(store["path"])).expanduser() if store.get("path") else None,
         neu_dir=(
             Path(str(data["neu_dir"])).expanduser() if data.get("neu_dir") else None
+        ),
+        # Serving hint (template `api:` block): LTTB ceiling the precompute
+        # records in the run provenance for the series router to honor.
+        api_max_points=(
+            int(api["max_points"]) if api.get("max_points") is not None else None
         ),
     )
 

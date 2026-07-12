@@ -1,8 +1,17 @@
 """Precompute orchestration + the ``gps-api-precompute`` console script.
 
-Per region (Phase-1 slice: one region per run), for every configured
-station, the job calls the ``gps_analysis`` public API — no math is derived
-here (MATH_STANDARDS rule):
+Two run shapes share one chain: :func:`run_precompute` handles a single
+region; :func:`run_fleet` (Phase-2 rollout) iterates **every** configured
+region into one coherent store — per-region ``velocities/*.geojson`` and
+``models/*_breaks.json``, one combined ``stations.geojson`` catalog
+spanning all regions, and a single ``meta/run.json`` summarizing the whole
+fleet run. Fault tolerance holds at both levels: one bad station is
+recorded and skipped inside its region; one bad region is recorded and
+skipped by the fleet.
+
+Per region, for every configured station, the job calls the
+``gps_analysis`` public API — no math is derived here (MATH_STANDARDS
+rule):
 
 1. :func:`gps_analysis.fit_components` — ``lineperiodic`` (or configured)
    trajectory fit per component, and :func:`gps_analysis.remove_trend` —
@@ -14,7 +23,10 @@ here (MATH_STANDARDS rule):
    + colored-noise parameters (``method="gbis"``), per component. The
    displacement series is passed straight in — the estimator
    zero-references internally (input-contract decision, PLAN-analysis-lane
-   §7), so the job must NOT pre-reference it.
+   §7), so the job must NOT pre-reference it. **Cost gate:** GBIS4TS runs
+   only for the regions in ``breakpoints.enabled_regions`` (selective by
+   design — WLS is the fleet-wide baseline; the 1e6-iteration chains are
+   never run across all stations).
 
 Products land in the file store (:mod:`gps_api.precompute.products`);
 ``GET /v1/velocities`` serves the velocity GeoJSON directly.
@@ -82,7 +94,11 @@ SeriesLoader = Callable[[str], StationSeries]
 
 @dataclasses.dataclass(frozen=True)
 class RunSummary:
-    """What one precompute run produced (also written to ``meta/run.json``)."""
+    """What one per-region precompute run produced.
+
+    Written to ``meta/run.json`` for a single-region run; embedded per
+    region in the :class:`FleetSummary` for a fleet run.
+    """
 
     region: str
     store: Path
@@ -91,10 +107,11 @@ class RunSummary:
     stations_ok: tuple[str, ...]
     stations_failed: dict[str, str]
     products: tuple[str, ...]
+    api_max_points: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-ready mapping for ``meta/run.json``."""
-        return {
+        payload: dict[str, Any] = {
             "region": self.region,
             "store": str(self.store),
             "fitted_at": self.fitted_at.isoformat().replace("+00:00", "Z"),
@@ -103,6 +120,65 @@ class RunSummary:
             "stations_failed": dict(self.stations_failed),
             "products": list(self.products),
         }
+        if self.api_max_points is not None:
+            payload["api"] = {"max_points": self.api_max_points}
+        return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class FleetSummary:
+    """What one fleet run produced (written to ``meta/run.json``).
+
+    Aggregates the per-region :class:`RunSummary` results plus the regions
+    that failed outright; totals give the per-station success/failure
+    counts across the whole fleet.
+    """
+
+    store: Path
+    fitted_at: datetime.datetime
+    source: str
+    regions: dict[str, RunSummary]
+    regions_failed: dict[str, str]
+    products: tuple[str, ...]
+    api_max_points: int | None = None
+
+    @property
+    def stations_ok_total(self) -> int:
+        """Stations that produced products, summed over successful regions."""
+        return sum(len(s.stations_ok) for s in self.regions.values())
+
+    @property
+    def stations_failed_total(self) -> int:
+        """Stations recorded as failed, summed over successful regions."""
+        return sum(len(s.stations_failed) for s in self.regions.values())
+
+    def as_dict(self) -> dict[str, Any]:
+        """JSON-ready mapping for ``meta/run.json`` (fleet shape)."""
+        payload: dict[str, Any] = {
+            "fleet": True,
+            "store": str(self.store),
+            "fitted_at": self.fitted_at.isoformat().replace("+00:00", "Z"),
+            "source": self.source,
+            "regions": {
+                name: {
+                    "stations_ok": list(summary.stations_ok),
+                    "stations_failed": dict(summary.stations_failed),
+                    "products": list(summary.products),
+                }
+                for name, summary in self.regions.items()
+            },
+            "regions_failed": dict(self.regions_failed),
+            "totals": {
+                "regions_ok": len(self.regions),
+                "regions_failed": len(self.regions_failed),
+                "stations_ok": self.stations_ok_total,
+                "stations_failed": self.stations_failed_total,
+            },
+            "products": list(self.products),
+        }
+        if self.api_max_points is not None:
+            payload["api"] = {"max_points": self.api_max_points}
+        return payload
 
 
 def _point(meta: StationMeta) -> PointGeometry:
@@ -240,6 +316,8 @@ def run_precompute(
     n_runs: int | None = None,
     t_runs: int | None = None,
     seed: int | None = 0,
+    write_catalog: bool = True,
+    write_meta: bool = True,
 ) -> RunSummary:
     """Run the full precompute for one region and write the products.
 
@@ -255,6 +333,10 @@ def run_precompute(
         n_runs / t_runs: Override the configured GBIS4TS chain lengths
             (dev runs; production uses the configured 1e6).
         seed: MCMC RNG seed (reproducibility).
+        write_catalog / write_meta: Whether to write ``stations.geojson``
+            and ``meta/run.json`` (defaults on). :func:`run_fleet` turns
+            both off per region and writes the combined catalog + fleet
+            summary itself, so a fleet store stays coherent.
 
     Per-station failures are recorded and skipped — one bad station must
     not sink the batch (fault-tolerance rule of the ops packages).
@@ -357,24 +439,27 @@ def run_precompute(
             f"precompute produced nothing — every station failed: {failed}"
         )
 
-    catalog = StationCollection(
-        features=[
-            StationFeature(
-                geometry=_point(meta[m]),
-                properties=StationProperties(
-                    marker=m, name=meta[m].name, regions=[region.name]
-                ),
-            )
-            for m in region.stations
-        ]
-    )
-    written.append(
-        str(
-            products.write_stations_geojson(
-                store, catalog, _provenance("catalog", config=str(cfg.analysis_yaml))
+    if write_catalog:
+        catalog = StationCollection(
+            features=[
+                StationFeature(
+                    geometry=_point(meta[m]),
+                    properties=StationProperties(
+                        marker=m, name=meta[m].name, regions=[region.name]
+                    ),
+                )
+                for m in region.stations
+            ]
+        )
+        written.append(
+            str(
+                products.write_stations_geojson(
+                    store,
+                    catalog,
+                    _provenance("catalog", config=str(cfg.analysis_yaml)),
+                )
             )
         )
-    )
     written.append(
         str(
             products.write_velocities_geojson(
@@ -415,9 +500,143 @@ def run_precompute(
         stations_ok=tuple(ok),
         stations_failed=failed,
         products=tuple(written),
+        api_max_points=cfg.api_max_points,
     )
-    products.write_run_meta(store, summary.as_dict())
+    if write_meta:
+        products.write_run_meta(store, summary.as_dict())
     return summary
+
+
+def run_fleet(
+    cfg: AnalysisConfig,
+    series_loader: SeriesLoader,
+    store: Path,
+    source: str,
+    *,
+    detect_breaks: bool | None = None,
+    n_runs: int | None = None,
+    t_runs: int | None = None,
+    seed: int | None = 0,
+) -> FleetSummary:
+    """Run the precompute for **every** configured region into one store.
+
+    Reuses :func:`run_precompute` per region (no math is duplicated) with
+    the per-region catalog/meta writes suppressed, then aggregates:
+
+    - ``stations.geojson`` — one combined catalog spanning all successful
+      regions; a station configured in several regions carries them all in
+      ``properties.regions`` (sorted). Stations of a *failed* region are
+      not cataloged (their products were not produced this run).
+    - ``velocities/<region>.geojson`` / ``models/<region>_breaks.json`` —
+      written per region by :func:`run_precompute`; break detection stays
+      gated by ``breakpoints.enabled_regions`` (``detect_breaks=None``).
+    - ``meta/run.json`` — a single :class:`FleetSummary` with per-region
+      and per-station success/failure counts.
+
+    Fault tolerance mirrors the station rule one level up: a region that
+    raises (bad config entry, missing station metadata, every station
+    failing) is recorded in ``regions_failed`` and skipped — one bad
+    region must not sink the fleet. Only when *every* region fails does
+    the run raise.
+
+    Args:
+        cfg: Loaded analysis-lane configuration (all its ``regions`` run).
+        series_loader: ``marker -> StationSeries`` shared by all regions.
+        store: Store root directory (created as needed).
+        source: Provenance tag describing the data source for the run.
+        detect_breaks / n_runs / t_runs / seed: Passed through to
+            :func:`run_precompute` (same semantics).
+
+    Raises:
+        RuntimeError: When every configured region failed.
+    """
+    fitted_at = datetime.datetime.now(datetime.UTC)
+    summaries: dict[str, RunSummary] = {}
+    regions_failed: dict[str, str] = {}
+    written: list[str] = []
+
+    for name in cfg.regions:
+        print(f"=== region {name} ===", flush=True)
+        try:
+            summary = run_precompute(
+                cfg,
+                name,
+                series_loader,
+                store,
+                source,
+                detect_breaks=detect_breaks,
+                n_runs=n_runs,
+                t_runs=t_runs,
+                seed=seed,
+                write_catalog=False,
+                write_meta=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — fleet survives one bad region
+            regions_failed[name] = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[region {name}] FAILED — {regions_failed[name]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        summaries[name] = summary
+        written.extend(summary.products)
+
+    if not summaries:
+        message = "fleet precompute produced nothing — every region failed"
+        raise RuntimeError(f"{message}: {regions_failed}")
+
+    # Combined catalog: every station of every successful region, with the
+    # full (sorted) list of regions that contain it.
+    memberships: dict[str, list[str]] = {}
+    for name in summaries:
+        for marker in cfg.region(name).stations:
+            memberships.setdefault(marker, []).append(name)
+    meta = load_station_meta(sorted(memberships))
+    frames = sorted({cfg.region(name).reference_frame for name in summaries})
+    catalog = StationCollection(
+        features=[
+            StationFeature(
+                geometry=_point(meta[marker]),
+                properties=StationProperties(
+                    marker=marker,
+                    name=meta[marker].name,
+                    regions=sorted(region_names),
+                ),
+            )
+            for marker, region_names in sorted(memberships.items())
+        ]
+    )
+    written.append(
+        str(
+            products.write_stations_geojson(
+                store,
+                catalog,
+                Provenance(
+                    method="catalog",
+                    frame=",".join(frames),
+                    fitted_at=fitted_at,
+                    source=source,
+                    extra={
+                        "config": str(cfg.analysis_yaml),
+                        "regions": sorted(summaries),
+                    },
+                ),
+            )
+        )
+    )
+
+    fleet = FleetSummary(
+        store=store,
+        fitted_at=fitted_at,
+        source=source,
+        regions=summaries,
+        regions_failed=regions_failed,
+        products=tuple(written),
+        api_max_points=cfg.api_max_points,
+    )
+    products.write_run_meta(store, fleet.as_dict())
+    return fleet
 
 
 def _neu_loader(neu_dir: Path) -> SeriesLoader:
@@ -447,8 +666,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Scheduled precompute for the GNSS analysis lane: runs the "
             "gps_analysis chain (trajectory fit + detrend, WLS velocity, "
-            "GBIS4TS break points) for one configured region and writes "
-            "Parquet/GeoJSON products to the store gps_api serves."
+            "GBIS4TS break points for gated regions) for one configured "
+            "region — or, with --fleet, every configured region — and "
+            "writes Parquet/GeoJSON products to the store gps_api serves."
         ),
     )
     parser.add_argument(
@@ -457,9 +677,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="analysis.yaml path (default: <gpsconfig dir>/analysis.yaml "
         "via gps_parser / $GPS_CONFIG_PATH)",
     )
-    parser.add_argument(
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
         "--region",
         help="region to precompute (default: the first configured region)",
+    )
+    scope.add_argument(
+        "--fleet",
+        "--all-regions",
+        action="store_true",
+        help="run every configured region into one coherent store "
+        "(combined station catalog, per-region products, one fleet "
+        "meta/run.json); break detection stays gated by "
+        "breakpoints.enabled_regions",
     )
     parser.add_argument(
         "--store",
@@ -509,7 +739,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Console entry point (``gps-api-precompute``) — foreground only."""
     args = _build_parser().parse_args(argv)
     cfg = load_analysis_config(args.config)
-    region_name = args.region or next(iter(cfg.regions))
     store = args.store or cfg.store_path or settings.store_path()
 
     loader: SeriesLoader
@@ -528,6 +757,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         source = f"neu:{neu_dir}"
         loader = _neu_loader(neu_dir)
 
+    if args.fleet:
+        fleet = run_fleet(
+            cfg,
+            loader,
+            store,
+            source,
+            detect_breaks=False if args.no_breakpoints else None,
+            n_runs=args.runs,
+            t_runs=args.t_runs,
+            seed=args.seed,
+        )
+        print(
+            f"fleet: {len(fleet.regions)} region(s) ok, "
+            f"{len(fleet.regions_failed)} failed; "
+            f"{fleet.stations_ok_total} station(s) ok, "
+            f"{fleet.stations_failed_total} failed; "
+            f"{len(fleet.products)} product file(s) under {fleet.store}"
+        )
+        for name, reason in fleet.regions_failed.items():
+            print(f"  region {name} FAILED — {reason}", file=sys.stderr)
+        clean = not fleet.regions_failed and fleet.stations_failed_total == 0
+        return 0 if clean else 1
+
+    region_name = args.region or next(iter(cfg.regions))
     summary = run_precompute(
         cfg,
         region_name,

@@ -21,6 +21,11 @@ dependencies = [
     "fastapi>=0.115",
     "pydantic>=2.9",
     "uvicorn>=0.32",
+    # Store-format readers for the wired endpoints: Parquet series need
+    # pyarrow; LTTB downsampling (presentation, not estimation) needs numpy.
+    # Still no gps_analysis/gps_parser at API runtime (CLAUDE.md rule).
+    "numpy>=2.1",
+    "pyarrow>=18",
 ]
 
 # Repo home: git.vedur.is (GitLab — services live there per plan §3; exact
@@ -50,17 +55,15 @@ dev = [
 ]
 # The precompute job (plan §3: "in gps_api or a sibling") lives in
 # gps_api.precompute. Its deps stay OUT of [project.dependencies]: the API
-# runtime never imports gps_analysis (CLAUDE.md rule) and serves the file
-# store with the stdlib only. Sibling packages are wired as editable local
-# paths via [tool.uv.sources] (gps_plot precedent — see gpslibrary/CLAUDE.md
-# "Editing Across Packages"); gps_analysis is on the analysis-lane-base
-# branch until the lane merges.
+# runtime never imports gps_analysis or gps_parser (CLAUDE.md rule) — it
+# reads the store files with numpy/pyarrow only. Sibling packages are wired
+# as editable local paths via [tool.uv.sources] (gps_plot precedent — see
+# gpslibrary/CLAUDE.md "Editing Across Packages"); gps_analysis is on the
+# analysis-lane-base branch until the lane merges.
 precompute = [
     "gps_analysis",
     "gps_parser",
     "gtimes>=0.5",
-    "numpy>=2.1",
-    "pyarrow>=18",
     "pyyaml>=6.0",
 ]
 

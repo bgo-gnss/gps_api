@@ -1,8 +1,12 @@
-"""Contract-shape tests for the scaffold.
+"""Contract-shape tests for the service surface.
 
-The endpoints are deliberate 501 stubs (Phase 0); what these tests pin down
-is the *contract*: every route exists, every error is ``{"detail": …}``, and
-the OpenAPI document describes the full surface in docs/API_CONTRACT.md.
+What these tests pin down is the *contract*: every route exists, every
+error is ``{"detail": …}``, and the OpenAPI document describes the full
+surface in docs/API_CONTRACT.md. The store-wired endpoints
+(``/v1/stations``, ``/v1/stations/{marker}/series``, ``/v1/velocities``,
+``/v1/models/{region}``) answer contract-shaped 404s on an empty store;
+the reserved endpoints (``/v1/models/{region}/history``, ``/v1/layers``,
+``/v1/query``) stay deliberate 501 stubs.
 """
 
 from pathlib import Path
@@ -16,11 +20,15 @@ from gps_api.main import create_app
 client = TestClient(create_app())
 
 STUB_GET_ROUTES = [
-    "/v1/stations",
-    "/v1/stations/SENG/series",
-    "/v1/models/reykjanes",
     "/v1/models/svartsengi/history",
     "/v1/layers",
+]
+
+WIRED_EMPTY_STORE_404_ROUTES = [
+    "/v1/stations",
+    "/v1/stations/SENG/series",
+    "/v1/velocities",
+    "/v1/models/reykjanes",
 ]
 
 CONTRACT_PATHS = [
@@ -35,6 +43,12 @@ CONTRACT_PATHS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _isolated_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point every test at an empty temp store — never at the user's cache."""
+    monkeypatch.setenv("GPS_API_STORE", str(tmp_path))
+
+
 def test_healthz() -> None:
     resp = client.get("/healthz")
     assert resp.status_code == 200
@@ -45,6 +59,14 @@ def test_healthz() -> None:
 def test_stub_get_endpoints_return_501_with_detail(path: str) -> None:
     resp = client.get(path)
     assert resp.status_code == 501
+    assert isinstance(resp.json()["detail"], str)
+
+
+@pytest.mark.parametrize("path", WIRED_EMPTY_STORE_404_ROUTES)
+def test_wired_endpoints_empty_store_is_404_with_detail(path: str) -> None:
+    """Store-wired endpoints answer a contract-shaped 404 on an empty store."""
+    resp = client.get(path)
+    assert resp.status_code == 404
     assert isinstance(resp.json()["detail"], str)
 
 
@@ -66,19 +88,29 @@ def test_unknown_route_uses_detail_shape() -> None:
     assert "detail" in resp.json()
 
 
-def test_velocities_empty_store_is_404_with_detail(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """/v1/velocities is store-wired: an empty store is a contract-shaped 404."""
-    monkeypatch.setenv("GPS_API_STORE", str(tmp_path))
-    resp = client.get("/v1/velocities")
-    assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
-
-
-def test_velocities_rejects_pathy_region(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_velocities_rejects_pathy_region() -> None:
     """Region names are validated (no path characters reach the store)."""
     resp = client.get("/v1/velocities", params={"region": "../etc"})
+    assert resp.status_code == 422
+    assert "detail" in resp.json()
+
+
+def test_series_rejects_pathy_marker() -> None:
+    """Markers are validated (no path characters reach the store)."""
+    resp = client.get("/v1/stations/SENG!/series")
+    assert resp.status_code == 422
+    assert "detail" in resp.json()
+
+
+def test_models_rejects_pathy_region() -> None:
+    resp = client.get("/v1/models/bad!region")
+    assert resp.status_code == 422
+    assert "detail" in resp.json()
+
+
+def test_series_rejects_undersized_max_points() -> None:
+    """The LTTB target keeps at least the two endpoint samples."""
+    resp = client.get("/v1/stations/SENG/series", params={"max_points": 1})
     assert resp.status_code == 422
     assert "detail" in resp.json()
 

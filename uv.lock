@@ -227,6 +227,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "numpy" },
+    { name = "pyarrow" },
     { name = "pydantic" },
     { name = "uvicorn" },
 ]
@@ -239,8 +241,6 @@ dev = [
     { name = "gtimes" },
     { name = "httpx2" },
     { name = "mypy" },
-    { name = "numpy" },
-    { name = "pyarrow" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pyyaml" },
@@ -251,14 +251,14 @@ precompute = [
     { name = "gps-analysis" },
     { name = "gps-parser" },
     { name = "gtimes" },
-    { name = "numpy" },
-    { name = "pyarrow" },
     { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "numpy", specifier = ">=2.1" },
+    { name = "pyarrow", specifier = ">=18" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "uvicorn", specifier = ">=0.32" },
 ]
@@ -271,8 +271,6 @@ dev = [
     { name = "gtimes", specifier = ">=0.5" },
     { name = "httpx2" },
     { name = "mypy", specifier = ">=1.13" },
-    { name = "numpy", specifier = ">=2.1" },
-    { name = "pyarrow", specifier = ">=18" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "pyyaml", specifier = ">=6.0" },
@@ -283,8 +281,6 @@ precompute = [
     { name = "gps-analysis", editable = "../gps_analysis" },
     { name = "gps-parser", editable = "../gps_parser" },
     { name = "gtimes", specifier = ">=0.5" },
-    { name = "numpy", specifier = ">=2.1" },
-    { name = "pyarrow", specifier = ">=18" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 
