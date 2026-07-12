@@ -176,6 +176,39 @@ and `test_invert_epoch_rejects_bound_pinned_optima` in
 model: the fix restores basic optimizer hygiene, and the remaining
 0.80-factor and early-cycle differences are reported above as what they are.
 
+## 6. What this validates — and what it does not
+
+**The inversion was genuinely free.** The harness fed no priors from the
+operational model: `depth_bounds_km` = default (0.1, 20.0) km (wide open, not
+around 4 km), `dv_bounds_m3` = None (ΔV unbounded), no `origin_lon/lat` (the
+tangent frame is the participating-station centroid), and the cold-start initial
+guess (`gps_analysis._mogi_start`) is derived entirely from the observed field —
+uplift-weighted centroid for position, median station→centroid distance for
+depth, the peak-uplift relation for ΔV. Evidence of real freedom: depth wandered
+to 3.71 ± 1.05 km (not pinned to 4.0), source scattered 1.67 km, ΔV landed at
+16.4e6 (operational 19.7e6). A biased/pinned inversion would show ~0 scatter and
+depth ≈ 4.0. It *disagreed* on depth — that is independence, not alignment.
+
+**But this is a method/code cross-validation on shared data, not an
+independent-data validation.** Both inversions fit GNSS from the *same station
+network* (we read the `.NEU` products; the operational model reads its `cgnss`),
+with the *same Mogi model*. So:
+- It **does** confirm our forward model + inversion machinery is *correct* —
+  independently coded, it recovers the same source position (0.32 km) and the
+  same surface field (r=0.99) as an established operational implementation.
+- It **does not** independently confirm the geophysical source: two correct Mogi
+  fits to the same data *should* agree, so a high r is partly built in, and a
+  shared model inadequacy would not show up.
+- The depth/ΔV **difference** (3.71 free vs 4.0 fixed; ratio 0.85) is the
+  informative part: the classic **depth–volume trade-off** — the surface cannot
+  cleanly separate depth from ΔV, so both fit at different points on the same
+  trade-off curve (see the vector comparison in `gps_plot/examples`).
+
+**Independent confirmation requires the joint GPS+InSAR lane** (`geo_dataread`
+InSAR groundwork): InSAR brings genuinely independent observations — a different
+line-of-sight geometry and dense spatial coverage — that break the depth–ΔV
+trade-off and constrain the source without relying on the same GNSS.
+
 ---
 
 *Baseline run 2026-07-12, gps_api `validate-deformation-realdata`. Rebuild the
