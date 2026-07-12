@@ -402,7 +402,14 @@ def test_deformation_stage_failure_is_recorded_not_fatal(
 
 
 def test_deformation_config_rejects_unimplemented_source() -> None:
-    with pytest.raises(ValueError, match="okada"):
+    with pytest.raises(ValueError, match="implemented sources"):
+        DeformationConfig(enabled_regions=("x",), source="joint")
+
+
+def test_deformation_okada_source_requires_a_plane_block() -> None:
+    """okada is now implemented, but the plane is operator-supplied — a bare
+    source='okada' without the okada: block is rejected (not auto-found)."""
+    with pytest.raises(ValueError, match="operator-supplied|okada"):
         DeformationConfig(enabled_regions=("x",), source="okada")
 
 

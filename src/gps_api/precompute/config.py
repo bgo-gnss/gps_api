@@ -24,6 +24,7 @@ at this boundary and coerced to concrete types immediately.
 from __future__ import annotations
 
 import dataclasses
+import math
 from pathlib import Path
 from typing import Any
 
@@ -96,25 +97,141 @@ class BreakpointConfig:
 #: Velocity estimators the precompute job implements (Amendment A5).
 VELOCITY_METHODS: tuple[str, ...] = ("wls", "mle")
 
-#: Deformation source models the precompute job implements (Amendment A6).
-DEFORMATION_SOURCES: tuple[str, ...] = ("mogi",)
+#: Deformation source models the precompute job implements (Amendments A6/A7:
+#: ``mogi`` = point-source ΔV(t) time series; ``okada`` = distributed-slip on
+#: an operator-supplied fault/dike plane, single window).
+DEFORMATION_SOURCES: tuple[str, ...] = ("mogi", "okada")
+
+#: Okada slip directions the distributed-slip stage may estimate.
+SLIP_COMPONENTS: tuple[str, ...] = ("strike_slip", "dip_slip", "opening")
+
+#: Default log-spaced (lo, hi, count) L-curve λ scan for slip regularization.
+DEFAULT_SLIP_SCAN: tuple[float, float, int] = (1.0e4, 1.0e10, 13)
+
+
+@dataclasses.dataclass(frozen=True)
+class OkadaPlaneConfig:
+    """Operator-supplied fault/dike plane for Okada distributed slip (A7).
+
+    Okada distributed-slip inversion **fixes the plane and inverts slip on
+    it** — the plane is NOT found automatically (that is the nonlinear
+    ``okada_invert`` / Bayesian lane). Because a dike/fault is event-specific,
+    the operator supplies the plane per intrusion in the ``deformation.okada``
+    block of ``analysis.yaml`` (config-driven, never hardcoded geometry).
+
+    The horizontal ``origin`` is the plane **centroid** (WGS84); ``strike`` is
+    the trace azimuth (deg clockwise from north, dip to its right) and ``dip``
+    the down-dip angle (0 < dip ≤ 90). ``top_depth_km`` is the depth of the
+    plane's shallow (up-dip) edge — the operator-friendly quantity — and is
+    converted to the centroid depth Okada 1985 uses via
+    :meth:`centroid_depth_km`. ``n_strike`` × ``n_dip`` tiles the plane
+    (:func:`gps_analysis.discretize_fault`); ``components`` names the slip
+    directions to estimate (default pure ``opening`` — a dike/sill).
+    ``smoothing`` is a fixed Laplacian weight λ, or ``None`` to pick it at the
+    L-curve corner over ``smoothing_scan`` (lo, hi, count log-spaced).
+    ``nonneg`` imposes one-signed slip (NNLS, Jónsson et al. 2002 — the dike
+    default); ``edge`` is the Laplacian boundary treatment.
+    """
+
+    origin_lon: float
+    origin_lat: float
+    strike: float
+    dip: float
+    length_km: float
+    width_km: float
+    top_depth_km: float
+    n_strike: int
+    n_dip: int
+    components: tuple[str, ...] = ("opening",)
+    smoothing: float | None = None
+    smoothing_scan: tuple[float, float, int] = DEFAULT_SLIP_SCAN
+    nonneg: bool = True
+    edge: str = "zero"
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.dip <= 90.0:
+            raise ValueError(
+                f"deformation.okada.dip must be in (0, 90], got {self.dip}"
+            )
+        for key in ("length_km", "width_km"):
+            if getattr(self, key) <= 0:
+                raise ValueError(f"deformation.okada.{key} must be > 0")
+        # top_depth_km >= 0 guarantees the discretize_fault surface-breach
+        # guard (centroid_depth >= sin(dip)*width/2) can never fire mid-stage.
+        if self.top_depth_km < 0.0:
+            raise ValueError(
+                f"deformation.okada.top_depth_km must be >= 0, got {self.top_depth_km}"
+            )
+        if self.n_strike < 1 or self.n_dip < 1:
+            raise ValueError(
+                f"deformation.okada grid must be >= 1x1, "
+                f"got {self.n_strike}x{self.n_dip}"
+            )
+        if not self.components:
+            raise ValueError(
+                "deformation.okada.components must name >= 1 slip direction"
+            )
+        unknown = set(self.components) - set(SLIP_COMPONENTS)
+        if unknown:
+            raise ValueError(
+                f"deformation.okada.components: unknown {sorted(unknown)}; "
+                f"choose from {SLIP_COMPONENTS}"
+            )
+        if len(set(self.components)) != len(self.components):
+            raise ValueError(
+                f"deformation.okada.components has duplicates: {self.components}"
+            )
+        if self.smoothing is not None and self.smoothing <= 0.0:
+            raise ValueError(
+                "deformation.okada.smoothing must be > 0 (or omit / 'lcurve' "
+                f"to select at the L-curve corner), got {self.smoothing}"
+            )
+        lo, hi, count = self.smoothing_scan
+        if not 0.0 < lo < hi or count < 3:
+            raise ValueError(
+                "deformation.okada.smoothing_scan must be (lo, hi, count) with "
+                f"0 < lo < hi and count >= 3, got {self.smoothing_scan}"
+            )
+        if self.edge not in ("zero", "free"):
+            raise ValueError(
+                f"deformation.okada.edge must be 'zero' or 'free', got {self.edge!r}"
+            )
+
+    def centroid_depth_km(self) -> float:
+        """Plane-centroid depth = top-edge depth + sin(dip)·width/2 [km].
+
+        The :class:`gps_analysis.OkadaSource` convention places the centroid
+        at ``(x, y, −depth)``; the config's ``top_depth_km`` is the shallow
+        up-dip edge, so the centroid sits half the down-dip projection deeper.
+        """
+        return (
+            self.top_depth_km + math.sin(math.radians(self.dip)) * self.width_km / 2.0
+        )
 
 
 @dataclasses.dataclass(frozen=True)
 class DeformationConfig:
-    """Mogi deformation-source inversion settings (``deformation:`` block).
+    """Deformation-source inversion settings (``deformation:`` block).
 
     Config-gated exactly like break detection: the stage runs only for
-    ``enabled_regions``. Per gated region, station displacements relative
-    to the start of a trailing ``window_years`` window are averaged over
-    ``epoch_mean_days`` around each grid epoch (spaced ``step_days``) and
-    inverted for one Mogi source per epoch (``gps_analysis.mogi_invert``)
-    — the ΔV(t)/depth/position time-series product of Amendment A6. When
-    ``bayes_n_runs > 0`` the newest epoch additionally gets a Bayesian
-    posterior (``gps_analysis.mogi_invert_bayes``; requires finite
-    ``dv_bounds_m3`` priors). ``origin_lon``/``origin_lat`` pin the local
-    tangent-plane frame; absent → the mean of the participating station
-    coordinates.
+    ``enabled_regions``. Two sources (``source``):
+
+    - ``"mogi"`` (Amendment A6) — per grid epoch, station displacements
+      relative to the start of a trailing ``window_years`` window are
+      averaged over ``epoch_mean_days`` around each grid epoch (spaced
+      ``step_days``) and inverted for one Mogi source (``mogi_invert``) — the
+      ΔV(t)/depth/position time series. When ``bayes_n_runs > 0`` the newest
+      epoch also gets a Bayesian posterior (``mogi_invert_bayes``; requires
+      finite ``dv_bounds_m3`` priors). ``origin_lon``/``origin_lat`` pin the
+      local tangent-plane frame; absent → the participating-station centroid.
+    - ``"okada"`` (Amendment A7) — a single-window distributed-slip inversion
+      on the operator-supplied :class:`OkadaPlaneConfig` (``okada`` field):
+      net displacement over the trailing ``window_years`` window is inverted
+      for smoothed slip/opening on the fixed plane
+      (``discretize_fault`` → ``okada_greens`` → ``okada_invert_slip``). The
+      local-frame origin is the plane centroid; the mogi-only fields
+      (``depth_bounds_km``, ``dv_bounds_m3``, ``bayes_*``, ``origin_*``) are
+      ignored.
     """
 
     enabled_regions: tuple[str, ...]
@@ -131,12 +248,21 @@ class DeformationConfig:
     origin_lat: float | None = None
     bayes_n_runs: int = 0
     bayes_t_runs: int = 100
+    #: Operator-supplied fault/dike plane — required when ``source == "okada"``
+    #: (the distributed-slip stage inverts slip on a fixed plane; Amendment A7).
+    okada: OkadaPlaneConfig | None = None
 
     def __post_init__(self) -> None:
         if self.source not in DEFORMATION_SOURCES:
             raise ValueError(
                 f"deformation.source={self.source!r} — implemented sources: "
-                f"{DEFORMATION_SOURCES} ('okada' arrives with a later slice)"
+                f"{DEFORMATION_SOURCES}"
+            )
+        if self.source == "okada" and self.okada is None:
+            raise ValueError(
+                "deformation.source='okada' requires an 'okada:' fault-plane "
+                "block — the plane is operator-supplied per intrusion "
+                "(distributed slip fixes the plane, it is not auto-found)"
             )
         if self.series not in ("raw", "detrended"):
             raise ValueError(
@@ -147,8 +273,9 @@ class DeformationConfig:
                 raise ValueError(f"deformation.{key} must be > 0")
         if self.min_stations < 2:
             raise ValueError(
-                "deformation.min_stations must be >= 2 (mogi_invert needs "
-                ">= 2 stations for 4 parameters)"
+                "deformation.min_stations must be >= 2 (mogi needs >= 2 "
+                "stations for 4 parameters; distributed slip needs a "
+                "resolvable network)"
             )
         lo, hi = self.depth_bounds_km
         if not 0 < lo < hi:
@@ -257,6 +384,67 @@ def _as_pair(value: object, what: str) -> tuple[float, float] | None:
     return float(value[0]), float(value[1])
 
 
+def _parse_okada(body: dict[str, Any]) -> OkadaPlaneConfig | None:
+    """Build the :class:`OkadaPlaneConfig` from a ``deformation.okada`` mapping.
+
+    Returns ``None`` when the block is absent (disabled). The plane is
+    operator-supplied and validated in :meth:`OkadaPlaneConfig.__post_init__`;
+    here we only narrow YAML nodes and report missing required keys.
+    """
+    if not body:
+        return None
+    origin = _as_mapping(body.get("origin"), "deformation.okada.origin")
+    required = {
+        "strike",
+        "dip",
+        "length_km",
+        "width_km",
+        "top_depth_km",
+        "n_strike",
+        "n_dip",
+    }
+    missing = sorted(required - body.keys())
+    if not origin or "lon" not in origin or "lat" not in origin:
+        missing.append("origin.{lon,lat}")
+    if missing:
+        raise ValueError(f"deformation.okada missing required key(s): {missing}")
+
+    smoothing_raw = body.get("smoothing")
+    if smoothing_raw is None or smoothing_raw == "lcurve":
+        smoothing: float | None = None
+    else:
+        smoothing = float(smoothing_raw)
+
+    scan_raw = body.get("smoothing_scan")
+    if scan_raw is None:
+        scan = DEFAULT_SLIP_SCAN
+    else:
+        if not isinstance(scan_raw, list | tuple) or len(scan_raw) != 3:
+            raise ValueError(
+                "deformation.okada.smoothing_scan must be [lo, hi, count], "
+                f"got {scan_raw!r}"
+            )
+        scan = (float(scan_raw[0]), float(scan_raw[1]), int(scan_raw[2]))
+
+    components = tuple(str(c) for c in body.get("components") or ("opening",))
+    return OkadaPlaneConfig(
+        origin_lon=float(origin["lon"]),
+        origin_lat=float(origin["lat"]),
+        strike=float(body["strike"]),
+        dip=float(body["dip"]),
+        length_km=float(body["length_km"]),
+        width_km=float(body["width_km"]),
+        top_depth_km=float(body["top_depth_km"]),
+        n_strike=int(body["n_strike"]),
+        n_dip=int(body["n_dip"]),
+        components=components,
+        smoothing=smoothing,
+        smoothing_scan=scan,
+        nonneg=bool(body.get("nonneg", True)),
+        edge=str(body.get("edge", "zero")),
+    )
+
+
 def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
     """Load the analysis-lane configuration.
 
@@ -307,6 +495,7 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
     deformation = _as_mapping(raw.get("deformation"), "deformation")
     bayes = _as_mapping(deformation.get("bayes"), "deformation.bayes")
     origin = _as_mapping(deformation.get("origin"), "deformation.origin")
+    okada_cfg = _parse_okada(_as_mapping(deformation.get("okada"), "deformation.okada"))
     store = _as_mapping(raw.get("store"), "store")
     data = _as_mapping(raw.get("data"), "data")
     api = _as_mapping(raw.get("api"), "api")
@@ -370,6 +559,7 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
             ),
             bayes_n_runs=int(bayes.get("n_runs", 0)),
             bayes_t_runs=int(bayes.get("t_runs", 100)),
+            okada=okada_cfg,
         ),
         # Optional κ search bounds for method="mle" regions (Amendment A5).
         velocity_kappa_bounds=_as_pair(

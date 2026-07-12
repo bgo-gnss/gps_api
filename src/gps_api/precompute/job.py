@@ -81,12 +81,14 @@ from gps_api.precompute.breaks import (
 )
 from gps_api.precompute.config import (
     AnalysisConfig,
+    DeformationConfig,
     StationMeta,
     load_analysis_config,
     load_station_meta,
 )
 from gps_api.precompute.deformation import compute_mogi_series
 from gps_api.precompute.products import Provenance
+from gps_api.precompute.slip import compute_slip_distribution
 from gps_api.precompute.sources import (
     COMPONENTS,
     FloatArray,
@@ -131,9 +133,9 @@ class RunSummary:
     stations_failed: dict[str, str]
     products: tuple[str, ...]
     api_max_points: int | None = None
-    #: Region-level note when the (config-gated) Mogi deformation stage
-    #: failed — the region's other products survive (fault-tolerance rule),
-    #: but the failure is recorded, never silent.
+    #: Region-level note when the (config-gated) deformation stage (Mogi or
+    #: Okada) failed — the region's other products survive (fault-tolerance
+    #: rule), but the failure is recorded, never silent.
     deformation_failed: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -183,7 +185,7 @@ class FleetSummary:
 
     @property
     def deformation_failed_total(self) -> int:
-        """Regions whose gated Mogi deformation stage failed."""
+        """Regions whose gated deformation stage (Mogi or Okada) failed."""
         return sum(1 for s in self.regions.values() if s.deformation_failed is not None)
 
     def as_dict(self) -> dict[str, Any]:
@@ -382,6 +384,120 @@ def _entry_from_summary(
         "y_ref_mm": summary.y_ref,
         "n_runs": summary.n_runs,
     }
+
+
+def _write_mogi_deformation(
+    store: Path,
+    region_name: str,
+    station_series: dict[str, StationSeries],
+    detrended: dict[str, FloatArray],
+    meta: dict[str, StationMeta],
+    dcfg: DeformationConfig,
+    fitted_at: datetime.datetime,
+    seed: int | None,
+    provenance: Callable[..., Provenance],
+) -> str:
+    """Mogi ΔV(t) stage (A6): fit + write ``models/<region>_deformation.json``."""
+    outcome = compute_mogi_series(
+        region_name, station_series, detrended, meta, dcfg, fitted_at, seed=seed
+    )
+    extra: dict[str, Any] = {
+        "series": dcfg.series,
+        "window_years": dcfg.window_years,
+        "step_days": dcfg.step_days,
+        "epoch_mean_days": dcfg.epoch_mean_days,
+        "min_stations": dcfg.min_stations,
+        "nu": dcfg.nu,
+        "depth_bounds_km": list(dcfg.depth_bounds_km),
+        "dv_bounds_m3": (
+            list(dcfg.dv_bounds_m3) if dcfg.dv_bounds_m3 is not None else None
+        ),
+        "epochs_skipped": outcome.epochs_skipped,
+        "stations_excluded": list(outcome.stations_excluded),
+        # Independent GNSS-only product — compared against, never derived
+        # from, Vincent's InSAR-side inv_volume_mogi.dat.
+        "cross_check": (
+            "independent GNSS-only analog of the operational Mogi "
+            "dV(t) at insar.vedur.is:/mnt/scratch/vincent/model/"
+            "svartsengi/inflation*/inv_volume_mogi.dat"
+        ),
+    }
+    if dcfg.bayes_n_runs > 0:
+        extra["bayes"] = {
+            "n_runs": dcfg.bayes_n_runs,
+            "t_runs": dcfg.bayes_t_runs,
+            "seed": seed,
+        }
+    path = products.write_deformation_json(
+        store, region_name, outcome.result, provenance("mogi", **extra)
+    )
+    print(
+        f"[region {region_name}] mogi deformation: "
+        f"{len(outcome.result.fits)} epoch(s) fitted, "
+        f"{outcome.epochs_skipped} skipped",
+        flush=True,
+    )
+    return str(path)
+
+
+def _write_okada_slip(
+    store: Path,
+    region_name: str,
+    station_series: dict[str, StationSeries],
+    detrended: dict[str, FloatArray],
+    meta: dict[str, StationMeta],
+    dcfg: DeformationConfig,
+    fitted_at: datetime.datetime,
+    provenance: Callable[..., Provenance],
+) -> str:
+    """Okada distributed-slip stage (A7): invert + write ``<region>_slip.json``."""
+    outcome = compute_slip_distribution(
+        region_name, station_series, detrended, meta, dcfg, fitted_at
+    )
+    okada = dcfg.okada
+    assert okada is not None  # DeformationConfig guarantees it for source=okada
+    result = outcome.result
+    extra: dict[str, Any] = {
+        "series": dcfg.series,
+        "window_years": dcfg.window_years,
+        "epoch_mean_days": dcfg.epoch_mean_days,
+        "min_stations": dcfg.min_stations,
+        "nu": dcfg.nu,
+        "plane": {
+            "origin": {"lon": okada.origin_lon, "lat": okada.origin_lat},
+            "strike": okada.strike,
+            "dip": okada.dip,
+            "length_km": okada.length_km,
+            "width_km": okada.width_km,
+            "top_depth_km": okada.top_depth_km,
+            "n_strike": okada.n_strike,
+            "n_dip": okada.n_dip,
+        },
+        "components": list(okada.components),
+        "nonneg": okada.nonneg,
+        "edge": okada.edge,
+        "smoothing": result.smoothing,
+        "smoothing_selected_by": result.smoothing_selected_by,
+        "stations_excluded": list(outcome.stations_excluded),
+        # Formal σ caveat (see slip.compute_slip_distribution): the per-patch
+        # covariance is the unconstrained linear-Gaussian one; under NNLS it
+        # is not exact for patches pinned at the slip >= 0 bound.
+        "sigma_note": (
+            "per-patch sigma is the unconstrained linear-Gaussian formal "
+            "covariance propagated through okada_greens/patch_laplacian; not "
+            "exact for patches pinned by the non-negativity constraint"
+        ),
+    }
+    path = products.write_slip_json(
+        store, region_name, result, provenance("okada", **extra)
+    )
+    print(
+        f"[region {region_name}] okada slip: {len(result.patches)} patch(es), "
+        f"lambda={result.smoothing:.3g} ({result.smoothing_selected_by}), "
+        f"{result.n_stations} station(s)",
+        flush=True,
+    )
+    return str(path)
 
 
 def run_precompute(
@@ -652,63 +768,41 @@ def run_precompute(
         )
 
     if deformation_on:
-        # Mogi ΔV(t) stage (Amendment A6). Stations that failed anywhere in
-        # the chain are excluded; a stage failure is recorded — the region's
+        # Deformation stage (Amendment A6 Mogi / A7 Okada slip, by
+        # deformation.source). Stations that failed anywhere in the chain are
+        # excluded; a stage failure is recorded — the region's
         # velocity/series/break products stay in the store.
         dcfg = cfg.deformation
+        kept_ok_series = {m: s for m, s in kept_series.items() if m in ok}
+        kept_ok_detrended = {m: d for m, d in kept_detrended.items() if m in ok}
         try:
-            mogi_outcome = compute_mogi_series(
-                region.name,
-                {m: s for m, s in kept_series.items() if m in ok},
-                {m: d for m, d in kept_detrended.items() if m in ok},
-                meta,
-                dcfg,
-                fitted_at,
-                seed=seed,
-            )
-            deformation_extra: dict[str, Any] = {
-                "series": dcfg.series,
-                "window_years": dcfg.window_years,
-                "step_days": dcfg.step_days,
-                "epoch_mean_days": dcfg.epoch_mean_days,
-                "min_stations": dcfg.min_stations,
-                "nu": dcfg.nu,
-                "depth_bounds_km": list(dcfg.depth_bounds_km),
-                "dv_bounds_m3": (
-                    list(dcfg.dv_bounds_m3) if dcfg.dv_bounds_m3 is not None else None
-                ),
-                "epochs_skipped": mogi_outcome.epochs_skipped,
-                "stations_excluded": list(mogi_outcome.stations_excluded),
-                # Independent GNSS-only product — compared against, never
-                # derived from, Vincent's InSAR-side inv_volume_mogi.dat.
-                "cross_check": (
-                    "independent GNSS-only analog of the operational Mogi "
-                    "dV(t) at insar.vedur.is:/mnt/scratch/vincent/model/"
-                    "svartsengi/inflation*/inv_volume_mogi.dat"
-                ),
-            }
-            if dcfg.bayes_n_runs > 0:
-                deformation_extra["bayes"] = {
-                    "n_runs": dcfg.bayes_n_runs,
-                    "t_runs": dcfg.bayes_t_runs,
-                    "seed": seed,
-                }
-            written.append(
-                str(
-                    products.write_deformation_json(
+            if dcfg.source == "okada":
+                written.append(
+                    _write_okada_slip(
                         store,
                         region.name,
-                        mogi_outcome.result,
-                        _provenance("mogi", **deformation_extra),
+                        kept_ok_series,
+                        kept_ok_detrended,
+                        meta,
+                        dcfg,
+                        fitted_at,
+                        _provenance,
                     )
                 )
-            )
-            print(
-                f"[region {region.name}] mogi deformation: "
-                f"{len(mogi_outcome.result.fits)} epoch(s) fitted, "
-                f"{mogi_outcome.epochs_skipped} skipped",
-                flush=True,
-            )
+            else:
+                written.append(
+                    _write_mogi_deformation(
+                        store,
+                        region.name,
+                        kept_ok_series,
+                        kept_ok_detrended,
+                        meta,
+                        dcfg,
+                        fitted_at,
+                        seed,
+                        _provenance,
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 — stage must not sink the region
             deformation_failed = f"{type(exc).__name__}: {exc}"
             print(
@@ -758,10 +852,10 @@ def run_fleet(
       ``properties.regions`` (sorted). Stations of a *failed* region are
       not cataloged (their products were not produced this run).
     - ``velocities/<region>.geojson`` / ``models/<region>_breaks.json`` /
-      ``models/<region>_deformation.json`` — written per region by
-      :func:`run_precompute`; break detection stays gated by
-      ``breakpoints.enabled_regions`` and the Mogi deformation stage by
-      ``deformation.enabled_regions`` (both ``None`` overrides).
+      ``models/<region>_deformation.json`` (Mogi) or ``<region>_slip.json``
+      (Okada) — written per region by :func:`run_precompute`; break detection
+      stays gated by ``breakpoints.enabled_regions`` and the deformation stage
+      by ``deformation.enabled_regions`` (both ``None`` overrides).
     - ``meta/run.json`` — a single :class:`FleetSummary` with per-region
       and per-station success/failure counts.
 
@@ -903,7 +997,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Scheduled precompute for the GNSS analysis lane: runs the "
             "gps_analysis chain (trajectory fit + detrend, WLS or "
-            "colored-noise MLE velocity, GBIS4TS break points and Mogi "
+            "colored-noise MLE velocity, GBIS4TS break points and Mogi/Okada "
             "deformation sources for gated regions) for one configured "
             "region — or, with --fleet, every configured region — and "
             "writes Parquet/GeoJSON/JSON products to the store gps_api "
@@ -995,8 +1089,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-deformation",
         action="store_true",
-        help="skip the Mogi deformation stage (otherwise gated by "
-        "deformation.enabled_regions in analysis.yaml)",
+        help="skip the deformation stage — Mogi ΔV(t) or Okada slip, by "
+        "deformation.source (otherwise gated by deformation.enabled_regions "
+        "in analysis.yaml)",
     )
     return parser
 
