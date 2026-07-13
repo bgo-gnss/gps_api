@@ -42,6 +42,17 @@ rule):
    product feeds ``GET /v1/deformation/{region}``; a stage failure is
    recorded on the run summary without sinking the region.
 
+5. :func:`gps_api.precompute.outliers.detect_station_outliers` — the
+   outlier-detection stage (design §5.1, contract Amendment A8), gated by
+   ``outliers.enabled`` (CLI ``--no-outliers``). Runs FIRST per station:
+   flags ride as additive Parquet columns (raw columns byte-identical),
+   the detrended columns become the residuals of the outlier-robust
+   step-augmented fit (``steps.csv`` known steps — the SENG lesson), all
+   downstream estimates (velocity, breaks, deformation) fit on the
+   INLIERS, and the protected ``SuspectedEvent`` clusters are written to
+   ``meta/suspected_steps.csv`` for operator review. Aborts/failures are
+   recorded in ``meta/run.json`` — loud, never silent.
+
 Products land in the file store (:mod:`gps_api.precompute.products`);
 ``GET /v1/velocities`` serves the velocity GeoJSON directly.
 
@@ -70,6 +81,7 @@ from gps_analysis import (
     lineperiodic,
     remove_trend,
 )
+from numpy.typing import NDArray
 
 from gps_api import settings
 from gps_api.precompute import products
@@ -85,8 +97,15 @@ from gps_api.precompute.config import (
     StationMeta,
     load_analysis_config,
     load_station_meta,
+    load_step_catalog,
 )
 from gps_api.precompute.deformation import compute_mogi_series
+from gps_api.precompute.outliers import (
+    StationOutliers,
+    config_hash,
+    detect_station_outliers,
+    mask_station_series,
+)
 from gps_api.precompute.products import Provenance
 from gps_api.precompute.slip import compute_slip_distribution
 from gps_api.precompute.sources import (
@@ -137,6 +156,28 @@ class RunSummary:
     #: Okada) failed — the region's other products survive (fault-tolerance
     #: rule), but the failure is recorded, never silent.
     deformation_failed: str | None = None
+    #: Whether the outlier-detection stage ran for this region — controls
+    #: whether the ``outliers_*`` keys appear in ``meta/run.json``.
+    outliers_enabled: bool = False
+    #: Stations whose detection hit the §3.5 excess-candidate abort: their
+    #: series proceeded UNMASKED (flags all-False) — loud, never silent
+    #: (design §5.1 ``outliers_aborted``).
+    outliers_aborted: tuple[str, ...] = ()
+    #: Stations whose detection *raised*: they proceed unmasked with their
+    #: products intact (fault tolerance, like ``deformation_failed``) and
+    #: the reason is recorded here.
+    outliers_failed: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: Suspected-event rows destined for ``meta/suspected_steps.csv``
+    #: (kept on the summary so fleet runs can aggregate across regions).
+    suspected_steps: tuple[dict[str, Any], ...] = ()
+
+    def outliers_dict(self) -> dict[str, Any]:
+        """The ``outliers_*`` members of the run.json payloads."""
+        return {
+            "outliers_aborted": list(self.outliers_aborted),
+            "outliers_failed": dict(self.outliers_failed),
+            "suspected_steps": len(self.suspected_steps),
+        }
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-ready mapping for ``meta/run.json``."""
@@ -151,6 +192,8 @@ class RunSummary:
         }
         if self.deformation_failed is not None:
             payload["deformation_failed"] = self.deformation_failed
+        if self.outliers_enabled:
+            payload.update(self.outliers_dict())
         if self.api_max_points is not None:
             payload["api"] = {"max_points": self.api_max_points}
         return payload
@@ -188,6 +231,11 @@ class FleetSummary:
         """Regions whose gated deformation stage (Mogi or Okada) failed."""
         return sum(1 for s in self.regions.values() if s.deformation_failed is not None)
 
+    @property
+    def outliers_failed_total(self) -> int:
+        """Stations whose outlier detection raised, summed over regions."""
+        return sum(len(s.outliers_failed) for s in self.regions.values())
+
     def as_dict(self) -> dict[str, Any]:
         """JSON-ready mapping for ``meta/run.json`` (fleet shape)."""
         payload: dict[str, Any] = {
@@ -205,6 +253,7 @@ class FleetSummary:
                         if summary.deformation_failed is not None
                         else {}
                     ),
+                    **(summary.outliers_dict() if summary.outliers_enabled else {}),
                 }
                 for name, summary in self.regions.items()
             },
@@ -214,6 +263,18 @@ class FleetSummary:
                 "regions_failed": len(self.regions_failed),
                 "stations_ok": self.stations_ok_total,
                 "stations_failed": self.stations_failed_total,
+                # Outlier-stage totals only when the stage ran anywhere —
+                # keeps pre-A8 fleet payload shapes byte-stable.
+                **(
+                    {
+                        "outliers_failed": self.outliers_failed_total,
+                        "outliers_aborted": sum(
+                            len(s.outliers_aborted) for s in self.regions.values()
+                        ),
+                    }
+                    if any(s.outliers_enabled for s in self.regions.values())
+                    else {}
+                ),
             },
             "products": list(self.products),
         }
@@ -335,6 +396,7 @@ def _station_break_tasks(
     n_runs: int,
     t_runs: int,
     seed: int | None,
+    outlier_flags: NDArray[np.bool_] | None = None,
 ) -> list[ComponentTask]:
     """Per-component GBIS4TS work items for one station (confirm settings).
 
@@ -342,19 +404,29 @@ def _station_break_tasks(
     zero-references internally — do not pre-reference here). The fixed
     white-noise amplitude follows the dev-viz heuristic: median
     observation σ, or the residual std when the source carries no σ.
+
+    ``outlier_flags`` (shape ``(3, N)``, True = outlier) applies the
+    per-component INLIER mask before the chain is queued — GBIS4TS
+    consumes the cleaned series (BGÓ Q8: its likelihood assumes no
+    blunders); the store keeps every epoch regardless.
     """
     tasks: list[ComponentTask] = []
     for i, component in enumerate(COMPONENTS):
+        keep = (
+            np.ones(series.t.size, dtype=np.bool_)
+            if outlier_flags is None
+            else ~outlier_flags[i]
+        )
         if series.sigma is not None:
-            wn_amp = float(np.median(series.sigma[i]))
+            wn_amp = float(np.median(series.sigma[i][keep]))
         else:
-            wn_amp = float(np.std(detrended[i]))
+            wn_amp = float(np.std(detrended[i][keep]))
         tasks.append(
             ComponentTask(
                 marker=series.marker,
                 component=component,
-                t=series.t,
-                y=series.y[i],
+                t=series.t[keep],
+                y=series.y[i][keep],
                 wn_amp=wn_amp,
                 n_breaks=n_breaks,
                 n_runs=n_runs,
@@ -509,6 +581,7 @@ def run_precompute(
     *,
     detect_breaks: bool | None = None,
     compute_deformation: bool | None = None,
+    compute_outliers: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
     triage_n_runs: int | None = None,
@@ -535,6 +608,16 @@ def run_precompute(
             failure is recorded on the summary
             (:attr:`RunSummary.deformation_failed`) without sinking the
             region's other products.
+        compute_outliers: Force the outlier-detection stage on/off;
+            ``None`` follows ``outliers.enabled`` in the config (design
+            §5.4; CLI ``--no-outliers``). When on, every station's series
+            gets flagged non-destructively (raw Parquet columns unchanged,
+            additive flag columns per design §5.2), the downstream
+            estimates (velocity, GBIS4TS breaks, deformation) fit on the
+            **inliers**, and the protected suspected-event clusters land in
+            ``meta/suspected_steps.csv``. A per-station detection failure
+            is recorded (:attr:`RunSummary.outliers_failed`) and the
+            station proceeds unmasked — fault tolerance, never silent.
         n_runs / t_runs: Override the configured GBIS4TS confirm chain
             lengths (dev runs; production uses the configured 1e6).
         triage_n_runs / triage_t_runs: Override the configured triage
@@ -570,6 +653,18 @@ def run_precompute(
         if compute_deformation is None
         else compute_deformation
     )
+    outliers_on = cfg.outliers.enabled if compute_outliers is None else compute_outliers
+    step_catalog = load_step_catalog(cfg.config_dir) if outliers_on else {}
+    if outliers_on and not step_catalog:
+        # The real-data finding (SENG): a stepless trajectory model
+        # over-flags real signal on active stations — say so up front.
+        print(
+            f"[region {region.name}] outliers: no steps.csv under "
+            f"{cfg.config_dir} — detection runs without known-step terms "
+            "(over-flagging risk on stations with equipment/coseismic steps)",
+            file=sys.stderr,
+            flush=True,
+        )
     runs = cfg.breakpoints.n_runs if n_runs is None else n_runs
     truns = cfg.breakpoints.t_runs if t_runs is None else t_runs
     triage_runs = (
@@ -612,6 +707,9 @@ def run_precompute(
     ok: list[str] = []
     failed: dict[str, str] = {}
     deformation_failed: str | None = None
+    outliers_aborted: list[str] = []
+    outliers_failed: dict[str, str] = {}
+    suspected_rows: list[dict[str, Any]] = []
 
     for marker in region.stations:
         model_name = cfg.detrend_model_for(marker)
@@ -623,20 +721,72 @@ def run_precompute(
         try:
             series = series_loader(marker)
             print(f"[{marker}] {series.t.size} epochs ({series.source})", flush=True)
-            fits = tuple(
-                fit_components(
-                    _MODEL_FUNCS[model_name],
-                    series.t,
-                    series.y,
-                    sigma=series.sigma,
-                    names=COMPONENTS,
+
+            # Outlier stage (design §5.1): flags + step-augmented robust
+            # fits. NON-destructive by construction — the raw series is
+            # written unchanged; detection failure is recorded and the
+            # station proceeds unmasked (fault tolerance, never silent).
+            station_outliers: StationOutliers | None = None
+            if outliers_on:
+                try:
+                    station_outliers = detect_station_outliers(
+                        series,
+                        _MODEL_FUNCS[model_name],
+                        cfg.outliers,
+                        step_catalog.get(marker, ()),
+                    )
+                except Exception as exc:  # noqa: BLE001 — station proceeds unmasked
+                    outliers_failed[marker] = f"{type(exc).__name__}: {exc}"
+                    print(
+                        f"[{marker}] outlier detection FAILED — "
+                        f"{outliers_failed[marker]} (station proceeds unmasked)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            if station_outliers is not None:
+                if station_outliers.aborted:
+                    # §3.5 excess-candidate abort: flags are all-False —
+                    # the station proceeds unmasked, loudly recorded.
+                    outliers_aborted.append(marker)
+                    print(
+                        f"[{marker}] outlier detection ABORTED "
+                        "(candidate fraction > max_flag_fraction — likely "
+                        "unmodeled signal; station proceeds unmasked, "
+                        "suspected events recorded)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                suspected_rows.extend(
+                    event.as_row(region.name, station_aborted=station_outliers.aborted)
+                    for event in station_outliers.events
                 )
-            )
-            detrended = np.asarray(
-                remove_trend(_MODEL_FUNCS[model_name], series.t, series.y, fits),
-                dtype=np.float64,
-            )
+                # Detrended columns = residuals of the outlier-robust
+                # step-augmented fit, evaluated at ALL epochs (design §5.1).
+                detrended = station_outliers.detrended
+                n_flagged = int(np.count_nonzero(station_outliers.union_flags))
+                print(
+                    f"[{marker}] outliers: {n_flagged} epoch(s) flagged, "
+                    f"{len(station_outliers.events)} suspected event(s)",
+                    flush=True,
+                )
+            else:
+                fits = tuple(
+                    fit_components(
+                        _MODEL_FUNCS[model_name],
+                        series.t,
+                        series.y,
+                        sigma=series.sigma,
+                        names=COMPONENTS,
+                    )
+                )
+                detrended = np.asarray(
+                    remove_trend(_MODEL_FUNCS[model_name], series.t, series.y, fits),
+                    dtype=np.float64,
+                )
             times = [yearf_to_datetime(float(v)) for v in series.t]
+            series_extra: dict[str, Any] = {"units": "mm", "marker": marker}
+            if station_outliers is not None:
+                series_extra["outliers"] = station_outliers.provenance()
             written.append(
                 str(
                     products.write_series_parquet(
@@ -644,13 +794,26 @@ def run_precompute(
                         series,
                         detrended,
                         times,
-                        _provenance(model_name, units="mm", marker=marker),
+                        _provenance(model_name, **series_extra),
+                        outliers=station_outliers,
                     )
                 )
             )
+            # HARD RULE (BGÓ): downstream parameter estimates fit on the
+            # INLIERS; the store keeps every epoch. Velocity/deformation
+            # take the union-inlier view (shared time axis across the
+            # three components); the per-component GBIS chains mask per
+            # component below.
+            if station_outliers is not None:
+                keep_union = ~station_outliers.union_flags
+                estimate_series = mask_station_series(series, keep_union)
+                estimate_detrended = detrended[:, keep_union]
+            else:
+                estimate_series = series
+                estimate_detrended = detrended
             velocity_features.append(
                 _velocity_feature(
-                    series, meta[marker], cfg, model_name, velocity_method
+                    estimate_series, meta[marker], cfg, model_name, velocity_method
                 )
             )
             print(
@@ -658,11 +821,13 @@ def run_precompute(
                 flush=True,
             )
             if deformation_on:
-                kept_series[marker] = series
-                kept_detrended[marker] = detrended
+                kept_series[marker] = estimate_series
+                kept_detrended[marker] = estimate_detrended
             if breaks_on:
                 # Chains are the fleet's cost — queue them for the pool
                 # instead of running the MCMC inline (perf-audit #1).
+                # GBIS4TS consumes the CLEANED (inlier) series (BGÓ Q8) —
+                # per-component masks, since each chain is per component.
                 break_tasks[marker] = _station_break_tasks(
                     series,
                     detrended,
@@ -670,6 +835,9 @@ def run_precompute(
                     n_runs=runs,
                     t_runs=truns,
                     seed=seed,
+                    outlier_flags=(
+                        None if station_outliers is None else station_outliers.flags
+                    ),
                 )
             ok.append(marker)
         except Exception as exc:  # noqa: BLE001 — batch survives one bad station
@@ -746,6 +914,13 @@ def run_precompute(
             "t_runs": truns,
             "seed": seed,
         }
+        if outliers_on:
+            # BGÓ Q8: the chains consumed the CLEANED (inlier) series —
+            # record the outlier-params hash that shaped that cleaning.
+            gbis_extra["outliers"] = {
+                "cleaned_input": True,
+                "params_hash": config_hash(cfg.outliers),
+            }
         if triage_stats is not None:
             # Triage is never a silent cap: the screen/flag counts ride in
             # the product provenance (and were logged during the run).
@@ -811,6 +986,12 @@ def run_precompute(
                 flush=True,
             )
 
+    if outliers_on and write_meta:
+        # Operator-review deliverable (design §5.1 / BGÓ Q5): the protected
+        # SuspectedEvent clusters as candidate steps.csv entries. Fleet
+        # runs suppress this (write_meta=False) and write the aggregate.
+        written.append(str(products.write_suspected_steps_csv(store, suspected_rows)))
+
     summary = RunSummary(
         region=region.name,
         store=store,
@@ -821,6 +1002,10 @@ def run_precompute(
         products=tuple(written),
         api_max_points=cfg.api_max_points,
         deformation_failed=deformation_failed,
+        outliers_enabled=outliers_on,
+        outliers_aborted=tuple(outliers_aborted),
+        outliers_failed=outliers_failed,
+        suspected_steps=tuple(suspected_rows),
     )
     if write_meta:
         products.write_run_meta(store, summary.as_dict())
@@ -835,6 +1020,7 @@ def run_fleet(
     *,
     detect_breaks: bool | None = None,
     compute_deformation: bool | None = None,
+    compute_outliers: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
     triage_n_runs: int | None = None,
@@ -870,9 +1056,9 @@ def run_fleet(
         series_loader: ``marker -> StationSeries`` shared by all regions.
         store: Store root directory (created as needed).
         source: Provenance tag describing the data source for the run.
-        detect_breaks / compute_deformation / n_runs / t_runs /
-            triage_n_runs / triage_t_runs / max_workers / seed: Passed
-            through to :func:`run_precompute` (same semantics).
+        detect_breaks / compute_deformation / compute_outliers / n_runs /
+            t_runs / triage_n_runs / triage_t_runs / max_workers / seed:
+            Passed through to :func:`run_precompute` (same semantics).
 
     Raises:
         RuntimeError: When every configured region failed.
@@ -893,6 +1079,7 @@ def run_fleet(
                 source,
                 detect_breaks=detect_breaks,
                 compute_deformation=compute_deformation,
+                compute_outliers=compute_outliers,
                 n_runs=n_runs,
                 t_runs=t_runs,
                 triage_n_runs=triage_n_runs,
@@ -956,6 +1143,14 @@ def run_fleet(
             )
         )
     )
+
+    if any(summary.outliers_enabled for summary in summaries.values()):
+        # One aggregated operator-review file across all regions (each row
+        # carries its region; region runs wrote nothing — write_meta=False).
+        fleet_rows = [
+            row for summary in summaries.values() for row in summary.suspected_steps
+        ]
+        written.append(str(products.write_suspected_steps_csv(store, fleet_rows)))
 
     fleet = FleetSummary(
         store=store,
@@ -1093,6 +1288,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "deformation.source (otherwise gated by deformation.enabled_regions "
         "in analysis.yaml)",
     )
+    parser.add_argument(
+        "--no-outliers",
+        action="store_true",
+        help="skip outlier detection (otherwise gated by outliers.enabled "
+        "in analysis.yaml): no flag columns, no suspected_steps.csv, and "
+        "downstream estimates fit on the unmasked series",
+    )
     return parser
 
 
@@ -1126,6 +1328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source,
             detect_breaks=False if args.no_breakpoints else None,
             compute_deformation=False if args.no_deformation else None,
+            compute_outliers=False if args.no_outliers else None,
             n_runs=args.runs,
             t_runs=args.t_runs,
             triage_n_runs=args.triage_runs,
@@ -1139,6 +1342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{fleet.stations_ok_total} station(s) ok, "
             f"{fleet.stations_failed_total} failed; "
             f"{fleet.deformation_failed_total} deformation stage(s) failed; "
+            f"{fleet.outliers_failed_total} outlier detection(s) failed; "
             f"{len(fleet.products)} product file(s) under {fleet.store}"
         )
         for name, reason in fleet.regions_failed.items():
@@ -1147,6 +1351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             not fleet.regions_failed
             and fleet.stations_failed_total == 0
             and fleet.deformation_failed_total == 0
+            and fleet.outliers_failed_total == 0
         )
         return 0 if clean else 1
 
@@ -1159,6 +1364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source,
         detect_breaks=False if args.no_breakpoints else None,
         compute_deformation=False if args.no_deformation else None,
+        compute_outliers=False if args.no_outliers else None,
         n_runs=args.runs,
         t_runs=args.t_runs,
         triage_n_runs=args.triage_runs,
@@ -1173,7 +1379,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     for path in summary.products:
         print(f"  {path}")
-    clean = not summary.stations_failed and summary.deformation_failed is None
+    clean = (
+        not summary.stations_failed
+        and summary.deformation_failed is None
+        and not summary.outliers_failed
+    )
     return 0 if clean else 1
 
 
