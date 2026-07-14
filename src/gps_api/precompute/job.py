@@ -53,6 +53,16 @@ rule):
    ``meta/suspected_steps.csv`` for operator review. Aborts/failures are
    recorded in ``meta/run.json`` — loud, never silent.
 
+6. :func:`gps_api.precompute.detrend.run_detrend_estimation` — the
+   detrend-parameter estimation stage (DESIGN_live_detrending §0), gated
+   by ``detrend.estimation.enabled`` (CLI ``--no-detrend-params``). Fits
+   :func:`gps_analysis.estimate_detrend` per station (pinned records kept
+   verbatim, ``use_sta`` borrows resolved, degraded fits loud) and writes
+   ``params/detrend_params.json`` — the exact document
+   ``geo_dataread.gps_views.read_detrend_params`` consumes (the stored
+   "estimate once, apply anywhere" background; deployment to gpsconfig is
+   a separate reviewed act).
+
 Products land in the file store (:mod:`gps_api.precompute.products`);
 ``GET /v1/velocities`` serves the velocity GeoJSON directly.
 
@@ -100,6 +110,7 @@ from gps_api.precompute.config import (
     load_step_catalog,
 )
 from gps_api.precompute.deformation import compute_mogi_series
+from gps_api.precompute.detrend import DetrendStageResult, run_detrend_estimation
 from gps_api.precompute.outliers import (
     StationOutliers,
     config_hash,
@@ -170,6 +181,13 @@ class RunSummary:
     #: Suspected-event rows destined for ``meta/suspected_steps.csv``
     #: (kept on the summary so fleet runs can aggregate across regions).
     suspected_steps: tuple[dict[str, Any], ...] = ()
+    #: Whether the detrend-parameter estimation stage ran for this region —
+    #: controls whether the ``detrend_params`` key appears in run.json.
+    detrend_enabled: bool = False
+    #: Stage outcome (fitted/pinned/borrowed/degraded/skipped + the station
+    #: records) — kept whole so fleet runs can merge one document across
+    #: regions; ``as_dict`` publishes only the summary, never the records.
+    detrend_params: DetrendStageResult | None = None
 
     def outliers_dict(self) -> dict[str, Any]:
         """The ``outliers_*`` members of the run.json payloads."""
@@ -194,6 +212,8 @@ class RunSummary:
             payload["deformation_failed"] = self.deformation_failed
         if self.outliers_enabled:
             payload.update(self.outliers_dict())
+        if self.detrend_enabled and self.detrend_params is not None:
+            payload["detrend_params"] = self.detrend_params.summary()
         if self.api_max_points is not None:
             payload["api"] = {"max_points": self.api_max_points}
         return payload
@@ -254,6 +274,12 @@ class FleetSummary:
                         else {}
                     ),
                     **(summary.outliers_dict() if summary.outliers_enabled else {}),
+                    **(
+                        {"detrend_params": summary.detrend_params.summary()}
+                        if summary.detrend_enabled
+                        and summary.detrend_params is not None
+                        else {}
+                    ),
                 }
                 for name, summary in self.regions.items()
             },
@@ -582,6 +608,7 @@ def run_precompute(
     detect_breaks: bool | None = None,
     compute_deformation: bool | None = None,
     compute_outliers: bool | None = None,
+    estimate_detrend_params: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
     triage_n_runs: int | None = None,
@@ -618,6 +645,15 @@ def run_precompute(
             ``meta/suspected_steps.csv``. A per-station detection failure
             is recorded (:attr:`RunSummary.outliers_failed`) and the
             station proceeds unmasked — fault tolerance, never silent.
+        estimate_detrend_params: Force the detrend-parameter estimation
+            stage on/off; ``None`` follows ``detrend.estimation.enabled``
+            (CLI ``--no-detrend-params``). When on, every station gets a
+            stored-detrend fit over the configured window (pinned records
+            honored verbatim, ``use_sta`` borrows resolved, degraded fits
+            recorded loudly) and the region's records land in
+            ``params/detrend_params.json`` — the document
+            ``geo_dataread.gps_views.read_detrend_params`` consumes.
+            Fleet runs merge all regions into one document.
         n_runs / t_runs: Override the configured GBIS4TS confirm chain
             lengths (dev runs; production uses the configured 1e6).
         triage_n_runs / triage_t_runs: Override the configured triage
@@ -654,7 +690,14 @@ def run_precompute(
         else compute_deformation
     )
     outliers_on = cfg.outliers.enabled if compute_outliers is None else compute_outliers
-    step_catalog = load_step_catalog(cfg.config_dir) if outliers_on else {}
+    detrend_on = (
+        cfg.detrend_estimation.enabled
+        if estimate_detrend_params is None
+        else estimate_detrend_params
+    )
+    step_catalog = (
+        load_step_catalog(cfg.config_dir) if (outliers_on or detrend_on) else {}
+    )
     if outliers_on and not step_catalog:
         # The real-data finding (SENG): a stepless trajectory model
         # over-flags real signal on active stations — say so up front.
@@ -703,6 +746,9 @@ def run_precompute(
     # the Mogi stage needs the whole region's fields at once.
     kept_series: dict[str, StationSeries] = {}
     kept_detrended: dict[str, FloatArray] = {}
+    # Raw (unmasked) series kept for the detrend-estimation stage — the
+    # leaf runs its OWN outlier stage on the raw series (design §2.4).
+    detrend_series: dict[str, StationSeries] = {}
     written: list[str] = []
     ok: list[str] = []
     failed: dict[str, str] = {}
@@ -721,6 +767,8 @@ def run_precompute(
         try:
             series = series_loader(marker)
             print(f"[{marker}] {series.t.size} epochs ({series.source})", flush=True)
+            if detrend_on:
+                detrend_series[marker] = series
 
             # Outlier stage (design §5.1): flags + step-augmented robust
             # fits. NON-destructive by construction — the raw series is
@@ -992,6 +1040,61 @@ def run_precompute(
         # runs suppress this (write_meta=False) and write the aggregate.
         written.append(str(products.write_suspected_steps_csv(store, suspected_rows)))
 
+    detrend_result: DetrendStageResult | None = None
+    if detrend_on:
+        # Detrend-parameter estimation (DESIGN_live_detrending §0): the
+        # writer half of the geo_dataread handshake. Estimation runs on the
+        # RAW plate-removed series of the stations that survived the chain;
+        # the record frame tag defaults to the plate-removed processing
+        # frame (decision 5 — plate-first; the .NEU lane inputs are the
+        # CDN plate products).
+        detrend_frame = (
+            cfg.detrend_estimation.frame or f"plate:{region.reference_frame}"
+        )
+        detrend_result = run_detrend_estimation(
+            cfg=cfg,
+            region_name=region.name,
+            frame=detrend_frame,
+            stations=region.stations,
+            series_map={m: s for m, s in detrend_series.items() if m in ok},
+            step_catalog=step_catalog,
+            store=store,
+            fitted_at=fitted_at,
+        )
+        print(
+            f"[region {region.name}] detrend params: "
+            f"{len(detrend_result.fitted)} fitted, "
+            f"{len(detrend_result.pinned)} pinned, "
+            f"{len(detrend_result.borrowed)} borrowed, "
+            f"{len(detrend_result.degraded)} degraded, "
+            f"{len(detrend_result.skipped)} skipped",
+            flush=True,
+        )
+        if write_meta:
+            # Single-region run: write the document here; fleet runs merge
+            # every region's records into ONE document (write_meta=False).
+            written.append(
+                str(
+                    products.write_detrend_params(
+                        store,
+                        detrend_result.records,
+                        Provenance(
+                            method=cfg.detrend_estimation.method,
+                            frame=detrend_frame,
+                            fitted_at=fitted_at,
+                            source=source,
+                            extra={
+                                "config": str(cfg.analysis_yaml),
+                                "detrend_estimation": (
+                                    cfg.detrend_estimation.as_dict()
+                                ),
+                                "stations": detrend_result.summary(),
+                            },
+                        ),
+                    )
+                )
+            )
+
     summary = RunSummary(
         region=region.name,
         store=store,
@@ -1006,6 +1109,8 @@ def run_precompute(
         outliers_aborted=tuple(outliers_aborted),
         outliers_failed=outliers_failed,
         suspected_steps=tuple(suspected_rows),
+        detrend_enabled=detrend_on,
+        detrend_params=detrend_result,
     )
     if write_meta:
         products.write_run_meta(store, summary.as_dict())
@@ -1021,6 +1126,7 @@ def run_fleet(
     detect_breaks: bool | None = None,
     compute_deformation: bool | None = None,
     compute_outliers: bool | None = None,
+    estimate_detrend_params: bool | None = None,
     n_runs: int | None = None,
     t_runs: int | None = None,
     triage_n_runs: int | None = None,
@@ -1056,8 +1162,9 @@ def run_fleet(
         series_loader: ``marker -> StationSeries`` shared by all regions.
         store: Store root directory (created as needed).
         source: Provenance tag describing the data source for the run.
-        detect_breaks / compute_deformation / compute_outliers / n_runs /
-            t_runs / triage_n_runs / triage_t_runs / max_workers / seed:
+        detect_breaks / compute_deformation / compute_outliers /
+            estimate_detrend_params / n_runs / t_runs / triage_n_runs /
+            triage_t_runs / max_workers / seed:
             Passed through to :func:`run_precompute` (same semantics).
 
     Raises:
@@ -1080,6 +1187,7 @@ def run_fleet(
                 detect_breaks=detect_breaks,
                 compute_deformation=compute_deformation,
                 compute_outliers=compute_outliers,
+                estimate_detrend_params=estimate_detrend_params,
                 n_runs=n_runs,
                 t_runs=t_runs,
                 triage_n_runs=triage_n_runs,
@@ -1151,6 +1259,49 @@ def run_fleet(
             row for summary in summaries.values() for row in summary.suspected_steps
         ]
         written.append(str(products.write_suspected_steps_csv(store, fleet_rows)))
+
+    if any(summary.detrend_enabled for summary in summaries.values()):
+        # One merged detrend-parameter document across all regions (region
+        # runs wrote nothing — write_meta=False). A station configured in
+        # several regions keeps its FIRST region's record — never silently
+        # overwritten by a later region.
+        merged: dict[str, dict[str, Any]] = {}
+        for summary in summaries.values():
+            if summary.detrend_params is None:
+                continue
+            for marker, record in summary.detrend_params.records.items():
+                merged.setdefault(marker, record)
+        detrend_frames = sorted(
+            {
+                cfg.detrend_estimation.frame
+                or f"plate:{cfg.region(name).reference_frame}"
+                for name, summary in summaries.items()
+                if summary.detrend_enabled
+            }
+        )
+        written.append(
+            str(
+                products.write_detrend_params(
+                    store,
+                    merged,
+                    Provenance(
+                        method=cfg.detrend_estimation.method,
+                        frame=",".join(detrend_frames),
+                        fitted_at=fitted_at,
+                        source=source,
+                        extra={
+                            "config": str(cfg.analysis_yaml),
+                            "detrend_estimation": cfg.detrend_estimation.as_dict(),
+                            "regions": {
+                                name: summary.detrend_params.summary()
+                                for name, summary in summaries.items()
+                                if summary.detrend_params is not None
+                            },
+                        },
+                    ),
+                )
+            )
+        )
 
     fleet = FleetSummary(
         store=store,
@@ -1295,6 +1446,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "in analysis.yaml): no flag columns, no suspected_steps.csv, and "
         "downstream estimates fit on the unmasked series",
     )
+    parser.add_argument(
+        "--no-detrend-params",
+        action="store_true",
+        help="skip detrend-parameter estimation (otherwise gated by "
+        "detrend.estimation.enabled in analysis.yaml): no "
+        "params/detrend_params.json document is written",
+    )
     return parser
 
 
@@ -1329,6 +1487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             detect_breaks=False if args.no_breakpoints else None,
             compute_deformation=False if args.no_deformation else None,
             compute_outliers=False if args.no_outliers else None,
+            estimate_detrend_params=False if args.no_detrend_params else None,
             n_runs=args.runs,
             t_runs=args.t_runs,
             triage_n_runs=args.triage_runs,
@@ -1365,6 +1524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         detect_breaks=False if args.no_breakpoints else None,
         compute_deformation=False if args.no_deformation else None,
         compute_outliers=False if args.no_outliers else None,
+        estimate_detrend_params=False if args.no_detrend_params else None,
         n_runs=args.runs,
         t_runs=args.t_runs,
         triage_n_runs=args.triage_runs,

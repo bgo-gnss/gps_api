@@ -207,6 +207,145 @@ class OutlierConfig:
         return payload
 
 
+#: Detrend estimation methods (DESIGN_live_detrending §0 decision 2):
+#: ``step_augmented_robust`` = outlier stage on before the final clean WLS
+#: (the new default); ``plain_wls`` = legacy semantics, no outlier stage.
+DETREND_ESTIMATION_METHODS: tuple[str, ...] = ("step_augmented_robust", "plain_wls")
+
+#: ``detrend.estimation.pinned`` spec meaning "keep the record already in
+#: the store document verbatim" (vs an explicit path to a record file).
+PIN_KEEP = "keep"
+
+
+@dataclasses.dataclass(frozen=True)
+class DetrendConfig:
+    """Detrend-parameter **estimation** settings (``detrend.estimation:``).
+
+    The writer half of the stored-detrend handshake
+    (``DESIGN_live_detrending.md`` §0 locked decisions): estimation is a
+    deliberate, occasional act — this block configures the precompute
+    stage that fits :func:`gps_analysis.estimate_detrend` per station and
+    writes the ``detrend_params.json`` document
+    :func:`geo_dataread.gps_views.read_detrend_params` consumes. Mirrors
+    the :class:`OutlierConfig` precedent: an absent ``estimation:`` block
+    keeps the stage disabled (backwards compatible); a present block
+    enables it unless it says ``enabled: false``.
+
+    Window policy (decision 7 — "as long as possible, min 1–2 yr"):
+    ``fit_window_years: null`` (the default) requests the WHOLE series;
+    a number requests the trailing window of that length; a per-station
+    ``fit_windows.<STA>: [start, end]`` override wins (the operator's
+    "fit the pre-unrest interval" tool). The leaf's validity gates
+    (``min_span_years`` / ``min_epochs`` / ``max_gap_years``) then decide
+    whether the window is usable — a failed gate means NO record for the
+    station (absent = "no background model"), recorded loudly in the run
+    summary, never a silently bad background.
+
+    ``max_rms_mm`` is the writer-side sanity gate (decision 4): a fit
+    whose worst-component inlier residual RMS exceeds it is treated as
+    degraded — the real-data SENG finding is that a window spanning
+    active unrest does NOT trip the outlier abort; the robust fit simply
+    swallows the transient into a garbage background (rms in the 100s of
+    mm). Degraded fits (rms gate or outlier abort) are only written when
+    ``write_degraded`` is true, and then carry an explicit
+    ``refs.degraded`` marker.
+
+    ``use_sta`` is the first-class borrowing map (decision 6): borrower →
+    donor; the borrower gets a self-contained copy of the donor's record
+    with ``borrowed`` provenance. ``pinned`` (decision 7) maps a station
+    to ``"keep"`` (honor the record already in the store document,
+    verbatim, never refit) or to a JSON file holding the record.
+    """
+
+    enabled: bool = True
+    method: str = "step_augmented_robust"
+    fit_window_years: float | None = None
+    min_span_years: float = 2.0
+    min_epochs: int = 365
+    max_gap_years: float = 0.5
+    max_rms_mm: float | None = 20.0
+    frame: str | None = None
+    write_degraded: bool = False
+    fit_windows: dict[str, tuple[float | None, float | None]] = dataclasses.field(
+        default_factory=dict
+    )
+    use_sta: dict[str, str] = dataclasses.field(default_factory=dict)
+    pinned: dict[str, str] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.method not in DETREND_ESTIMATION_METHODS:
+            raise ValueError(
+                f"detrend.estimation.method must be one of "
+                f"{DETREND_ESTIMATION_METHODS}, got {self.method!r}"
+            )
+        if self.fit_window_years is not None and self.fit_window_years <= 0.0:
+            raise ValueError("detrend.estimation.fit_window_years must be > 0")
+        # Decision 7 floor: the fit window must span at least 1-2 years.
+        if self.min_span_years < 1.0:
+            raise ValueError(
+                "detrend.estimation.min_span_years must be >= 1.0 (design "
+                f"§0.7: fit window min 1-2 yr), got {self.min_span_years}"
+            )
+        if self.min_epochs < 2:
+            raise ValueError("detrend.estimation.min_epochs must be >= 2")
+        if self.max_gap_years <= 0.0:
+            raise ValueError("detrend.estimation.max_gap_years must be > 0")
+        if self.max_rms_mm is not None and self.max_rms_mm <= 0.0:
+            raise ValueError(
+                "detrend.estimation.max_rms_mm must be > 0 (or null to disable)"
+            )
+        for marker, (start, end) in self.fit_windows.items():
+            if start is not None and end is not None and end <= start:
+                raise ValueError(
+                    f"detrend.estimation.fit_windows.{marker}: end {end} "
+                    f"<= start {start}"
+                )
+        for borrower, donor in self.use_sta.items():
+            if borrower == donor:
+                raise ValueError(
+                    f"detrend.estimation.use_sta.{borrower}: cannot borrow from itself"
+                )
+            if donor in self.use_sta:
+                raise ValueError(
+                    f"detrend.estimation.use_sta.{borrower}: donor {donor!r} "
+                    "is itself a borrower - borrow chains are not allowed "
+                    "(records must be self-contained, design §2.6)"
+                )
+            if borrower in self.pinned:
+                raise ValueError(
+                    f"detrend.estimation: station {borrower!r} is both pinned "
+                    "and in use_sta - configure one, loudly"
+                )
+        for marker, spec in self.pinned.items():
+            if not str(spec).strip():
+                raise ValueError(
+                    f"detrend.estimation.pinned.{marker}: spec must be "
+                    f"{PIN_KEEP!r} or a record-file path"
+                )
+
+    def window_for(
+        self, marker: str, t_last: float
+    ) -> tuple[float | None, float | None]:
+        """Fit window for one station (override > trailing policy > open).
+
+        Open bounds mean "as long as possible" (decision 7) — the leaf's
+        validity gates decide whether the resulting window is usable.
+        """
+        if marker in self.fit_windows:
+            return self.fit_windows[marker]
+        if self.fit_window_years is not None:
+            return (t_last - self.fit_window_years, None)
+        return (None, None)
+
+    def as_dict(self) -> dict[str, Any]:
+        """JSON-ready mapping of the whole resolved block (provenance)."""
+        payload = dataclasses.asdict(self)
+        payload["fit_windows"] = {
+            marker: list(window) for marker, window in self.fit_windows.items()
+        }
+        return payload
+
+
 #: Component tags a ``steps.csv`` row may carry (``ALL`` = every component).
 STEP_COMPONENTS: tuple[str, ...] = ("N", "E", "U", "ALL")
 
@@ -522,6 +661,12 @@ class AnalysisConfig:
     outliers: OutlierConfig = dataclasses.field(
         default_factory=lambda: OutlierConfig(enabled=False)
     )
+    #: Detrend-parameter estimation stage settings; an absent
+    #: ``detrend.estimation:`` block keeps the stage disabled (backwards
+    #: compatible — the ``detrend_params.json`` writer is opt-in config).
+    detrend_estimation: DetrendConfig = dataclasses.field(
+        default_factory=lambda: DetrendConfig(enabled=False)
+    )
     velocity_kappa_bounds: tuple[float, float] | None = None
     store_path: Path | None = None
     neu_dir: Path | None = None
@@ -691,6 +836,51 @@ def _parse_outliers(body: dict[str, Any]) -> OutlierConfig:
     )
 
 
+def _parse_detrend_estimation(body: dict[str, Any]) -> DetrendConfig:
+    """Build the :class:`DetrendConfig` from a ``detrend.estimation:`` mapping.
+
+    An absent/empty block disables the stage; a present block enables it
+    unless it carries ``enabled: false``. ``fit_windows`` entries are
+    ``[start, end]`` fractional-year pairs where either bound may be null
+    (open); ``use_sta`` maps borrower → donor; ``pinned`` maps a station
+    to ``"keep"`` or a record-file path.
+    """
+    if not body:
+        return DetrendConfig(enabled=False)
+    windows: dict[str, tuple[float | None, float | None]] = {}
+    windows_raw = _as_mapping(body.get("fit_windows"), "detrend.estimation.fit_windows")
+    for marker, window_raw in windows_raw.items():
+        if not isinstance(window_raw, list | tuple) or len(window_raw) != 2:
+            raise ValueError(
+                f"detrend.estimation.fit_windows.{marker} must be a "
+                f"[start, end] pair (either bound may be null), got {window_raw!r}"
+            )
+        windows[str(marker)] = (
+            float(window_raw[0]) if window_raw[0] is not None else None,
+            float(window_raw[1]) if window_raw[1] is not None else None,
+        )
+    use_sta_raw = _as_mapping(body.get("use_sta"), "detrend.estimation.use_sta")
+    pinned_raw = _as_mapping(body.get("pinned"), "detrend.estimation.pinned")
+    window_years_raw = body.get("fit_window_years")
+    max_rms_raw = body.get("max_rms_mm", 20.0)
+    return DetrendConfig(
+        enabled=bool(body.get("enabled", True)),
+        method=str(body.get("method", "step_augmented_robust")),
+        fit_window_years=(
+            float(window_years_raw) if window_years_raw is not None else None
+        ),
+        min_span_years=float(body.get("min_span_years", 2.0)),
+        min_epochs=int(body.get("min_epochs", 365)),
+        max_gap_years=float(body.get("max_gap_years", 0.5)),
+        max_rms_mm=float(max_rms_raw) if max_rms_raw is not None else None,
+        frame=str(body["frame"]) if body.get("frame") else None,
+        write_degraded=bool(body.get("write_degraded", False)),
+        fit_windows=windows,
+        use_sta={str(k): str(v) for k, v in use_sta_raw.items()},
+        pinned={str(k): str(v) for k, v in pinned_raw.items()},
+    )
+
+
 def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
     """Load the analysis-lane configuration.
 
@@ -810,6 +1000,11 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
         ),
         # Outlier-detection stage (design §5.4): absent block → disabled.
         outliers=_parse_outliers(outliers),
+        # Detrend-parameter estimation (DESIGN_live_detrending §0): the
+        # ``detrend.estimation:`` sub-block; absent → stage disabled.
+        detrend_estimation=_parse_detrend_estimation(
+            _as_mapping(detrend.get("estimation"), "detrend.estimation")
+        ),
         # Optional κ search bounds for method="mle" regions (Amendment A5).
         velocity_kappa_bounds=_as_pair(
             velocity.get("kappa_bounds"), "velocity.kappa_bounds"
