@@ -437,6 +437,50 @@ def test_rms_gate_degrades_a_bad_background() -> None:
     assert degrade is not None and "max_rms_mm" in degrade
 
 
+def test_rms_gate_is_per_component_horizontal_vs_vertical() -> None:
+    """Horizontal (N,E) uses max_rms_mm; vertical (U) uses max_rms_mm_up (BGÓ)."""
+    series = _clean_series("RMSC", seed=12)
+    # Vertical-only trip: horizontal gate wide open, vertical gate tight.
+    _, up_degrade = estimate_station_record(
+        series,
+        "lineperiodic",
+        DetrendConfig(max_rms_mm=100.0, max_rms_mm_up=0.5),
+        fitted_at=FITTED_AT,
+        region=REGION,
+        frame=FRAME,
+    )
+    assert up_degrade is not None
+    assert "max_rms_mm_up" in up_degrade and "vertical" in up_degrade
+    assert "horizontal" not in up_degrade
+    # Horizontal-only trip: vertical gate wide open, horizontal gate tight.
+    _, horiz_degrade = estimate_station_record(
+        series,
+        "lineperiodic",
+        DetrendConfig(max_rms_mm=0.5, max_rms_mm_up=100.0),
+        fitted_at=FITTED_AT,
+        region=REGION,
+        frame=FRAME,
+    )
+    assert horiz_degrade is not None
+    assert "horizontal" in horiz_degrade
+    assert "max_rms_mm_up" not in horiz_degrade
+    # Both wide open: a clean fit is written (not degraded).
+    record, degrade = estimate_station_record(
+        series,
+        "lineperiodic",
+        DetrendConfig(max_rms_mm=100.0, max_rms_mm_up=100.0),
+        fitted_at=FITTED_AT,
+        region=REGION,
+        frame=FRAME,
+    )
+    assert degrade is None and record is not None
+
+
+def test_max_rms_mm_up_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="max_rms_mm_up must be > 0"):
+        DetrendConfig(max_rms_mm_up=0.0)
+
+
 def test_missing_pin_and_missing_donor_are_skipped_loudly(
     run: dict[str, Any], tmp_path: Path
 ) -> None:

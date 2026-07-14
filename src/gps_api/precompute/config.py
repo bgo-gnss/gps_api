@@ -241,14 +241,17 @@ class DetrendConfig:
     station (absent = "no background model"), recorded loudly in the run
     summary, never a silently bad background.
 
-    ``max_rms_mm`` is the writer-side sanity gate (decision 4): a fit
-    whose worst-component inlier residual RMS exceeds it is treated as
-    degraded — the real-data SENG finding is that a window spanning
-    active unrest does NOT trip the outlier abort; the robust fit simply
-    swallows the transient into a garbage background (rms in the 100s of
-    mm). Degraded fits (rms gate or outlier abort) are only written when
-    ``write_degraded`` is true, and then carry an explicit
-    ``refs.degraded`` marker.
+    ``max_rms_mm`` / ``max_rms_mm_up`` are the writer-side sanity gate
+    (decision 4): a fit whose inlier residual RMS exceeds the threshold is
+    treated as degraded — the real-data SENG finding is that a window
+    spanning active unrest does NOT trip the outlier abort; the robust fit
+    simply swallows the transient into a garbage background (rms in the
+    100s of mm). The gate is per-component with a looser VERTICAL bound
+    (``max_rms_mm_up``, BGÓ 2026-07-14): horizontal (N, E) RMS is checked
+    against ``max_rms_mm``, vertical (U) against ``max_rms_mm_up`` — GNSS
+    vertical noise runs ~2-3x the horizontal. Degraded fits (rms gate or
+    outlier abort) are only written when ``write_degraded`` is true, and
+    then carry an explicit ``refs.degraded`` marker.
 
     ``use_sta`` is the first-class borrowing map (decision 6): borrower →
     donor; the borrower gets a self-contained copy of the donor's record
@@ -264,6 +267,7 @@ class DetrendConfig:
     min_epochs: int = 365
     max_gap_years: float = 0.5
     max_rms_mm: float | None = 20.0
+    max_rms_mm_up: float | None = 30.0
     frame: str | None = None
     write_degraded: bool = False
     fit_windows: dict[str, tuple[float | None, float | None]] = dataclasses.field(
@@ -293,6 +297,10 @@ class DetrendConfig:
         if self.max_rms_mm is not None and self.max_rms_mm <= 0.0:
             raise ValueError(
                 "detrend.estimation.max_rms_mm must be > 0 (or null to disable)"
+            )
+        if self.max_rms_mm_up is not None and self.max_rms_mm_up <= 0.0:
+            raise ValueError(
+                "detrend.estimation.max_rms_mm_up must be > 0 (or null to disable)"
             )
         for marker, (start, end) in self.fit_windows.items():
             if start is not None and end is not None and end <= start:
@@ -863,6 +871,7 @@ def _parse_detrend_estimation(body: dict[str, Any]) -> DetrendConfig:
     pinned_raw = _as_mapping(body.get("pinned"), "detrend.estimation.pinned")
     window_years_raw = body.get("fit_window_years")
     max_rms_raw = body.get("max_rms_mm", 20.0)
+    max_rms_up_raw = body.get("max_rms_mm_up", 30.0)
     return DetrendConfig(
         enabled=bool(body.get("enabled", True)),
         method=str(body.get("method", "step_augmented_robust")),
@@ -873,6 +882,7 @@ def _parse_detrend_estimation(body: dict[str, Any]) -> DetrendConfig:
         min_epochs=int(body.get("min_epochs", 365)),
         max_gap_years=float(body.get("max_gap_years", 0.5)),
         max_rms_mm=float(max_rms_raw) if max_rms_raw is not None else None,
+        max_rms_mm_up=float(max_rms_up_raw) if max_rms_up_raw is not None else None,
         frame=str(body["frame"]) if body.get("frame") else None,
         write_degraded=bool(body.get("write_degraded", False)),
         fit_windows=windows,

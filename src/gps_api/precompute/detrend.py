@@ -242,17 +242,35 @@ def estimate_station_record(
     degrade: str | None = None
     if estimate.outlier_abort:
         degrade = "outlier stage aborted (excess-candidate rule); plain-WLS fallback"
-    finite_rms = [value for value in estimate.rms if not math.isnan(value)]
-    worst_rms = max(finite_rms, default=float("nan"))
+    # Per-component RMS sanity gate (BGÓ 2026-07-14): horizontal (N, E)
+    # against max_rms_mm, vertical (U) against the looser max_rms_mm_up —
+    # GNSS vertical noise runs ~2-3x horizontal. rms rows are N/E/U
+    # (sources.COMPONENTS order).
+    rms = list(estimate.rms)
+    horiz_rms = [rms[i] for i in (0, 1) if i < len(rms) and not math.isnan(rms[i])]
+    worst_horiz = max(horiz_rms, default=float("nan"))
+    up_rms = rms[2] if len(rms) > 2 else float("nan")
+    rms_reason: str | None = None
     if (
         dcfg.max_rms_mm is not None
-        and not math.isnan(worst_rms)
-        and worst_rms > dcfg.max_rms_mm
+        and not math.isnan(worst_horiz)
+        and worst_horiz > dcfg.max_rms_mm
     ):
         rms_reason = (
-            f"inlier residual RMS {worst_rms:.1f} mm exceeds max_rms_mm "
-            f"{dcfg.max_rms_mm:g} (unmodeled signal in the fit window?)"
+            f"horizontal inlier residual RMS {worst_horiz:.1f} mm exceeds "
+            f"max_rms_mm {dcfg.max_rms_mm:g} (unmodeled signal in the fit window?)"
         )
+    if (
+        dcfg.max_rms_mm_up is not None
+        and not math.isnan(up_rms)
+        and up_rms > dcfg.max_rms_mm_up
+    ):
+        up_reason = (
+            f"vertical inlier residual RMS {up_rms:.1f} mm exceeds "
+            f"max_rms_mm_up {dcfg.max_rms_mm_up:g} (unmodeled signal in the fit window?)"
+        )
+        rms_reason = f"{rms_reason}; {up_reason}" if rms_reason else up_reason
+    if rms_reason is not None:
         degrade = f"{degrade}; {rms_reason}" if degrade else rms_reason
 
     refs: dict[str, Any] = {"region": region, "source": series.source}
