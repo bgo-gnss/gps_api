@@ -117,6 +117,29 @@ operator review (Q5); aborts (`outliers_aborted`) and failures
 (`outliers_failed`) land in `meta/run.json`, station proceeds unmasked —
 loud, never silently clipped.
 
+**Detrend-parameter estimation** (2026-07-14, `precompute/detrend.py`;
+design: `gps_analysis/docs/DESIGN_live_detrending.md` §0): the WRITER half
+of the geo_dataread handshake — gated by the `analysis.yaml`
+`detrend.estimation:` block (`DetrendConfig`; CLI `--no-detrend-params`;
+absent block = off). Per station: window policy (whole series by default,
+"as long as possible" §0.7; trailing `fit_window_years`; per-station
+`fit_windows` override) → `gps_analysis.estimate_detrend` (leaf gates +
+`steps.csv` step augmentation, union over components + the resolved
+`outliers:` thresholds/floors) → `DetrendEstimate.to_record` →
+`params/detrend_params.json` (`{"schema_version": 1, "stations": {STA:
+record}}` — byte-compatible with `geo_dataread.gps_views.read_detrend_params`;
+fleet runs merge one document). Frame tag `plate:<region frame>` (plate-first
+§0.5 — the `.NEU` inputs are plate products); `pinned: {STA: keep|path}` =
+honor verbatim, never refit (§0.7); `use_sta: {borrower: donor}` = self-
+contained borrowed record + `borrowed` provenance (§0.6). Graceful + LOUD
+(§0.4): gate failures → station absent + reason in `meta/run.json`
+`detrend_params.skipped`; outlier abort OR `max_rms_mm` excess (real-data
+SENG finding: an unrest-spanning window does NOT abort — the robust fit
+swallows the transient, rms 100s of mm; the rms gate catches it) →
+`degraded`, written only under `write_degraded: true` with `refs.degraded`.
+The store document is a CANDIDATE — deploy to gpsconfig (where geo_dataread
+resolves it) stays BGÓ's reviewed act (§3.3).
+
 **Parallel breaks + triage** (`precompute/breaks.py`, perf-audit #1/#6 +
 plan §10.7): the gated GBIS4TS chains fan out over a
 `ProcessPoolExecutor` (spawn; workers return 256-byte scalar
@@ -135,7 +158,7 @@ to the old serial path (tests pin exact equality).
 ```
 src/gps_api/{main.py, schemas.py, settings.py, downsample.py,
              routers/{stations,velocities,models,deformation,layers,query}.py,
-             precompute/{config,sources,products,job,breaks,outliers,deformation,slip}.py,
+             precompute/{config,sources,products,job,breaks,outliers,detrend,deformation,slip}.py,
              validation/realdata.py}  # real-data harness (precompute-side)
 tests/test_app.py         # contract-shape tests (routes, 404/501+detail, OpenAPI)
 tests/test_precompute.py  # end-to-end: config → precompute (region + fleet) → store → wired endpoints
@@ -143,6 +166,7 @@ tests/test_outliers_wiring.py  # A8 slice: byte-identical raw columns, additive 
 tests/test_breaks_parallel.py  # pool==serial parity, triage flags, bounded summaries, fault tolerance
 tests/test_deformation.py # Mogi ΔV(t) recovery + MLE velocities + gating + endpoint + fault tolerance
 tests/test_slip.py        # Okada distributed-slip recovery + σ faithfulness + L-curve + gating + endpoint + fault tolerance
+tests/test_detrend_params.py  # detrend-params writer: geo_dataread round-trip handshake, schema-v2 refusal, pinning/UseSTA/degrade, real SENG pre-unrest + unrest behavior (imports geo_dataread — editable sibling; module skips without it)
 tests/test_downsample.py  # LTTB property tests + single-channel reference parity
 tests/test_validation_realdata.py  # env-gated real-data reconciliation (skipped w/o fixture)
 ```
@@ -153,6 +177,7 @@ uv run gps-api-precompute --synthetic --runs 2000  # foreground batch (dev chain
 uv run gps-api-precompute --neu-dir <dir>          # real .NEU products, one region
 uv run gps-api-precompute --fleet --neu-dir <dir>  # all configured regions, one store
 uv run gps-api-precompute --no-outliers ...        # skip the outlier stage (A8)
+uv run gps-api-precompute --no-detrend-params ...  # skip detrend-params estimation
 uv run ruff check src tests && uv run black --check src tests
 uv run mypy src tests && uv run pytest
 ```
@@ -167,7 +192,11 @@ uv run mypy src tests && uv run pytest
   those imports are allowed.
 
 ---
-*Last reviewed: 2026-07-13 (wire-outlier-detection: `precompute/outliers.py`
+*Last reviewed: 2026-07-14 (detrend-estimation-precompute: `precompute/detrend.py`
++ `DetrendConfig` (`detrend.estimation:` block), `params/detrend_params.json`
+writer byte-compatible with `geo_dataread.gps_views.read_detrend_params` —
+pinning/UseSTA/degrade per DESIGN_live_detrending §0; real-data SENG rms-gate
+finding. Prior 2026-07-13: wire-outlier-detection: `precompute/outliers.py`
 + `OutlierConfig`/`load_step_catalog`, additive parquet flag columns +
 `suspected_steps.csv`, inlier-fitted downstream estimates, series `clean`
 param + `outlier` flags — Amendment A8; develops against gps_analysis

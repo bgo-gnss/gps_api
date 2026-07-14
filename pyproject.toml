@@ -109,6 +109,14 @@ module = ["gps_parser.*", "gtimes.*", "pyarrow.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
+# geo_dataread (no py.typed marker) is imported ONLY by the handshake tests
+# (tests/test_detrend_params.py) to prove the written detrend_params.json
+# round-trips through the real reader; src/ never imports it.
+[[tool.mypy.overrides]]
+module = ["geo_dataread.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]

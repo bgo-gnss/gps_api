@@ -27,6 +27,7 @@ VELOCITIES_DIR = "velocities"
 SERIES_DIR = "series"
 MODELS_DIR = "models"
 META_DIR = "meta"
+PARAMS_DIR = "params"
 
 #: Store file names (shared vocabulary of writer and readers).
 STATIONS_FILE = "stations.geojson"
@@ -34,6 +35,10 @@ RUN_META_FILE = "run.json"
 #: Operator-review deliverable of the outlier stage (design §5.1 / BGÓ Q5):
 #: protected SuspectedEvent clusters as candidate steps.csv entries.
 SUSPECTED_STEPS_FILE = "suspected_steps.csv"
+#: Stored detrend-parameter document (DESIGN_live_detrending §3) — the
+#: candidate the estimation stage writes under ``params/``; the DEPLOYED
+#: copy geo_dataread reads lives in gpsconfig (BGÓ's review + deploy step).
+DETREND_PARAMS_FILE = "detrend_params.json"
 
 #: Parquet schema-metadata key carrying product provenance. Lives here (not
 #: in ``precompute.products``) so the series router can read it without

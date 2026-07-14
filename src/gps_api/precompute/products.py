@@ -285,6 +285,61 @@ def write_slip_json(
     return _write_json(store / settings.MODELS_DIR / f"{region}_slip.json", payload)
 
 
+#: Schema version of the ``params/detrend_params.json`` document. MUST
+#: match ``geo_dataread.gps_views.DOC_SCHEMA_VERSION`` — the reader rejects
+#: any other version (DESIGN_live_detrending §3.2 rules; the handshake).
+DETREND_PARAMS_SCHEMA_VERSION = 1
+
+
+def write_detrend_params(
+    store: Path, stations: dict[str, dict[str, Any]], provenance: Provenance
+) -> Path:
+    """Write the stored detrend-parameter document (``params/detrend_params.json``).
+
+    The exact document ``geo_dataread.gps_views.read_detrend_params``
+    consumes (DESIGN_live_detrending §3.2)::
+
+        {"schema_version": 1, ..., "stations": {"<MARKER>": <leaf record>}}
+
+    where each station value is a :meth:`gps_analysis.DetrendEstimate.to_record`
+    dict (self-contained: model code + step epochs + full per-component
+    parameter vectors + covariances + ``fitted_at``/``frame``/``borrowed``
+    provenance). Extra top-level members (``frame``, ``generated_at``,
+    ``provenance``) are informational — the reader validates only
+    ``schema_version`` and the ``stations`` mapping. Floats keep full
+    ``repr`` precision (:func:`json.dumps` default), so store → load →
+    apply is bit-identical to fit → apply.
+
+    A station ABSENT from ``stations`` means "no background model"
+    (consumers degrade to the raw view) — the explicit successor of the
+    legacy CSV's all-zero placeholder rows. The document written here is
+    the store CANDIDATE; deployment to gpsconfig (where geo_dataread's
+    default resolution looks) is BGÓ's reviewed, out-of-project step
+    (design §3.3).
+
+    Args:
+        store: Store root.
+        stations: Marker → leaf station record (may be empty — "stage ran,
+            nothing usable", never "stage skipped").
+        provenance: Run provenance; ``fitted_at`` stamps ``generated_at``.
+    """
+    payload: dict[str, Any] = {
+        "schema_version": DETREND_PARAMS_SCHEMA_VERSION,
+        "generated_at": _iso_z(provenance.fitted_at),
+        "generator": "gps-api-precompute detrend-estimation",
+    }
+    frames = {record.get("frame") for record in stations.values()}
+    if len(frames) == 1 and None not in frames:
+        # Document-level frame tag (design §2.5) — only when unambiguous;
+        # the per-record frame is authoritative either way.
+        payload["frame"] = frames.pop()
+    payload["provenance"] = provenance.as_dict()
+    payload["stations"] = stations
+    return _write_json(
+        store / settings.PARAMS_DIR / settings.DETREND_PARAMS_FILE, payload
+    )
+
+
 def write_run_meta(store: Path, summary: dict[str, Any]) -> Path:
     """Write the run-level provenance summary (``meta/run.json``)."""
     return _write_json(store / settings.META_DIR / settings.RUN_META_FILE, summary)
