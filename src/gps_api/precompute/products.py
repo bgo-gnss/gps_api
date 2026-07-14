@@ -9,6 +9,7 @@ Layout under the store root (:func:`gps_api.settings.store_path`)::
     models/<region>_deformation.json Mogi ΔV(t) source time series (A6)
     models/<region>_slip.json        Okada distributed-slip distribution (A7)
     meta/run.json                    provenance summary of the last run
+    meta/suspected_steps.csv         operator-review step candidates (outlier stage)
 
 Contract mapping (``docs/API_CONTRACT.md`` / :mod:`gps_api.schemas`):
 
@@ -34,6 +35,7 @@ software versions, ``fitted_at`` (UTC), input source.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import datetime
 import json
@@ -45,6 +47,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from gps_api import __version__, settings
+from gps_api.precompute.outliers import SUSPECTED_STEPS_COLUMNS, StationOutliers
 from gps_api.precompute.sources import COMPONENTS, FloatArray, StationSeries
 from gps_api.schemas import (
     DeformationResult,
@@ -139,6 +142,7 @@ def write_series_parquet(
     detrended: FloatArray,
     times: list[datetime.datetime],
     provenance: Provenance,
+    outliers: StationOutliers | None = None,
 ) -> Path:
     """Write one station's bulk series product (raw + detrended, mm).
 
@@ -147,6 +151,17 @@ def write_series_parquet(
     none), ``north_detrended``/... (trajectory-model residuals, mm).
     Provenance rides in the Parquet schema metadata under
     :data:`PROVENANCE_METADATA_KEY`.
+
+    When the outlier stage ran (``outliers`` given), the **additive** flag
+    columns of design §5.2 are appended — the raw columns above stay
+    byte-identical to a no-outlier run (requirement 3: non-destructive):
+    ``<component>_outlier`` (bool, final per-component flags),
+    ``<component>_outlier_reason`` (uint8 ``REASON_*`` bitmask),
+    ``<component>_outlier_protected`` (uint8 ``PROTECT_*`` bitmask) and
+    ``outlier_epoch`` (bool, union over components — the serving
+    convenience the ``clean`` API parameter drops on). Absent columns mean
+    the product predates the feature (or the stage was off/aborted-free —
+    the provenance ``outliers`` object says which).
     """
     columns: dict[str, Any] = {
         "time": pa.array(times, type=pa.timestamp("ms", tz="UTC")),
@@ -158,12 +173,43 @@ def write_series_parquet(
             columns[f"sigma_{component}"] = pa.array(series.sigma[i], type=pa.float64())
     for i, component in enumerate(COMPONENTS):
         columns[f"{component}_detrended"] = pa.array(detrended[i], type=pa.float64())
+    if outliers is not None:
+        for i, component in enumerate(COMPONENTS):
+            columns[f"{component}_outlier"] = pa.array(
+                outliers.flags[i], type=pa.bool_()
+            )
+            columns[f"{component}_outlier_reason"] = pa.array(
+                outliers.reasons[i], type=pa.uint8()
+            )
+            columns[f"{component}_outlier_protected"] = pa.array(
+                outliers.protected[i], type=pa.uint8()
+            )
+        columns["outlier_epoch"] = pa.array(outliers.union_flags, type=pa.bool_())
     table = pa.table(columns).replace_schema_metadata(
         {PROVENANCE_METADATA_KEY: json.dumps(provenance.as_dict()).encode()}
     )
     path = store / settings.SERIES_DIR / f"{series.marker}.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path)
+    return path
+
+
+def write_suspected_steps_csv(store: Path, rows: list[dict[str, Any]]) -> Path:
+    """Write the operator-review step-candidate file (design §5.1 / BGÓ Q5).
+
+    ``meta/suspected_steps.csv`` — the protected ``SuspectedEvent``
+    clusters of every station the outlier stage processed, as candidate
+    ``steps.csv`` entries / suspected-icing hints for visual assessment.
+    Written whenever the stage ran (header-only when nothing was
+    protected, so "empty file" reads as "stage ran, nothing suspected",
+    never as "stage skipped").
+    """
+    path = store / settings.META_DIR / settings.SUSPECTED_STEPS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUSPECTED_STEPS_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
     return path
 
 

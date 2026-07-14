@@ -20,6 +20,13 @@ Series specifics:
   (``analysis.yaml`` ``api.max_points``, recorded by the precompute job in
   ``meta/run.json``): it acts as the default target when the client sends
   no ``max_points`` and clamps the client's value when it does.
+- ``clean`` (contract Amendment A8) opts into dropping outlier-flagged
+  epochs **before** LTTB (flag spikes otherwise dominate the triangle
+  selection). The default is ``false`` — the raw series is the default
+  truth (non-destructive rule); served points then carry the per-epoch
+  ``outlier`` union flag, and the response echoes the store's
+  outlier-detection provenance. Products without flag columns (pre-A8)
+  serve ``outlier=null`` and ignore ``clean``.
 """
 
 import json
@@ -103,6 +110,17 @@ def station_series(
         ),
     ] = None,
     detrended: bool = True,
+    clean: Annotated[
+        bool,
+        Query(
+            description=(
+                "drop outlier-flagged epochs before downsampling "
+                "(Amendment A8); default false — the raw series is the "
+                "default truth, flagged points are served with their "
+                "'outlier' marker instead of being hidden"
+            ),
+        ),
+    ] = False,
 ) -> SeriesResponse:
     """N/E/U displacement series for one station (on-demand, downsampleable)."""
     path = settings.store_path() / settings.SERIES_DIR / f"{marker}.parquet"
@@ -138,6 +156,17 @@ def station_series(
             if has_sigma
             else None
         )
+        # Outlier flags (A8): the union column written by the outlier
+        # stage; absent → product predates the feature (nullable fields).
+        outliers = (
+            np.asarray(table.column("outlier_epoch").to_pylist(), dtype=bool)
+            if "outlier_epoch" in columns
+            else None
+        )
+        outlier_provenance_raw = provenance.get("outliers")
+        outlier_provenance: dict[str, Any] | None = (
+            outlier_provenance_raw if isinstance(outlier_provenance_raw, dict) else None
+        )
     except (KeyError, ValueError, OSError) as exc:
         raise HTTPException(
             status_code=500,
@@ -151,11 +180,17 @@ def station_series(
         mask &= seconds >= _as_utc(start).timestamp()
     if end is not None:
         mask &= seconds <= _as_utc(end).timestamp()
+    if clean and outliers is not None:
+        # A8: cleaning drops ONLY the flagged epochs, and does so BEFORE
+        # LTTB — outlier spikes otherwise dominate the triangle selection.
+        mask &= ~outliers
     keep = np.flatnonzero(mask)
     seconds = seconds[keep]
     values = values[:, keep]
     if sigmas is not None:
         sigmas = sigmas[:, keep]
+    if outliers is not None:
+        outliers = outliers[keep]
     times = [times[int(i)] for i in keep]
 
     # LTTB target: client intent clamped by the store's configured ceiling.
@@ -168,6 +203,8 @@ def station_series(
         values = values[:, idx]
         if sigmas is not None:
             sigmas = sigmas[:, idx]
+        if outliers is not None:
+            outliers = outliers[idx]
         times = [times[int(i)] for i in idx]
 
     # Row order fixed by _COMPONENTS = (north, east, up).
@@ -175,6 +212,7 @@ def station_series(
         marker=marker,
         frame=frame,
         detrended=detrended,
+        clean=clean,
         time=times,
         north=values[0].tolist(),
         east=values[1].tolist(),
@@ -182,4 +220,6 @@ def station_series(
         sigma_north=sigmas[0].tolist() if sigmas is not None else None,
         sigma_east=sigmas[1].tolist() if sigmas is not None else None,
         sigma_up=sigmas[2].tolist() if sigmas is not None else None,
+        outlier=outliers.tolist() if outliers is not None else None,
+        outlier_provenance=outlier_provenance,
     )

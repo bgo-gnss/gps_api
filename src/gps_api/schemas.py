@@ -51,12 +51,28 @@ class StationCollection(BaseModel):
 
 
 class SeriesResponse(BaseModel):
-    """GET /stations/{marker}/series — N/E/U displacement time series."""
+    """GET /stations/{marker}/series — N/E/U displacement time series.
+
+    Amendment A8 (outlier flags, non-destructive): the raw series is the
+    default truth. ``clean`` echoes the query parameter — ``false`` (the
+    default) serves every stored epoch with the per-epoch ``outlier``
+    union flag alongside; ``true`` drops the flagged epochs **before**
+    LTTB downsampling (outlier spikes otherwise dominate the triangle
+    selection). ``outlier``/``outlier_provenance`` are ``None`` for
+    products predating the outlier stage (pre-A8 stores).
+    """
 
     marker: str
     frame: str = Field(description="reference frame / plate fix, e.g. 'ITRF2014'")
     units: Literal["mm"] = "mm"
     detrended: bool
+    clean: bool = Field(
+        default=False,
+        description=(
+            "whether flagged outlier epochs were dropped before "
+            "downsampling (A8; the default false serves the raw truth)"
+        ),
+    )
     time: list[datetime]
     north: list[float]
     east: list[float]
@@ -64,6 +80,23 @@ class SeriesResponse(BaseModel):
     sigma_north: list[float] | None = None
     sigma_east: list[float] | None = None
     sigma_up: list[float] | None = None
+    outlier: list[bool] | None = Field(
+        default=None,
+        description=(
+            "per served epoch: flagged as an outlier in ANY component "
+            "(the store's union column; A8) — null when the product "
+            "predates outlier detection"
+        ),
+    )
+    outlier_provenance: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "echo of the store's outlier-detection provenance (method, "
+            "OutlierParams, per-component counts, suspected events, "
+            "abort state, params_hash) so any consumer can see what "
+            "would be/was removed and with which parameters (A8)"
+        ),
+    )
 
 
 class ComponentNoise(BaseModel):

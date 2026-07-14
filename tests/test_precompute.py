@@ -554,6 +554,45 @@ def test_series_endpoint_raw_vs_detrended(fleet_client: TestClient) -> None:
     assert raw.sigma_north == det.sigma_north
 
 
+def test_series_endpoint_pre_a8_store_is_nullable(fleet_client: TestClient) -> None:
+    """A8 backwards compatibility: no outliers: block → no flag columns.
+
+    A store whose precompute ran without the outlier stage serves
+    ``outlier=null`` / ``outlier_provenance=null`` and ``clean=true`` is a
+    no-op (there is nothing to drop) — pre-A8 consumers see the exact
+    payload they always did.
+    """
+    default = SeriesResponse.model_validate(
+        fleet_client.get("/v1/stations/SENG/series").json()
+    )
+    assert default.clean is False
+    assert default.outlier is None
+    assert default.outlier_provenance is None
+    cleaned = SeriesResponse.model_validate(
+        fleet_client.get("/v1/stations/SENG/series", params={"clean": True}).json()
+    )
+    assert cleaned.clean is True
+    assert cleaned.time == default.time  # nothing flagged, nothing dropped
+    assert cleaned.outlier is None
+
+
+def test_run_meta_has_no_outlier_keys_when_stage_is_off(fleet_store: Path) -> None:
+    """The outliers_* run.json keys appear only when the stage ran."""
+    meta = json.loads((fleet_store / "meta" / "run.json").read_text())
+    for region_meta in meta["regions"].values():
+        assert "outliers_aborted" not in region_meta
+        assert "outliers_failed" not in region_meta
+    assert "outliers_failed" not in meta["totals"]
+    assert not (fleet_store / "meta" / "suspected_steps.csv").exists()
+
+
+def test_series_parquet_has_no_flag_columns_when_stage_is_off(
+    fleet_store: Path,
+) -> None:
+    table = pq.read_table(fleet_store / "series" / "SENG.parquet")
+    assert not {c for c in table.column_names if "outlier" in c}
+
+
 def test_series_endpoint_unknown_marker_is_404(fleet_client: TestClient) -> None:
     resp = fleet_client.get("/v1/stations/QQQQ/series")
     assert resp.status_code == 404

@@ -31,6 +31,9 @@ META_DIR = "meta"
 #: Store file names (shared vocabulary of writer and readers).
 STATIONS_FILE = "stations.geojson"
 RUN_META_FILE = "run.json"
+#: Operator-review deliverable of the outlier stage (design §5.1 / BGÓ Q5):
+#: protected SuspectedEvent clusters as candidate steps.csv entries.
+SUSPECTED_STEPS_FILE = "suspected_steps.csv"
 
 #: Parquet schema-metadata key carrying product provenance. Lives here (not
 #: in ``precompute.products``) so the series router can read it without

@@ -23,6 +23,7 @@ at this boundary and coerced to concrete types immediately.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import math
 from pathlib import Path
@@ -92,6 +93,197 @@ class BreakpointConfig:
     def enabled_for(self, region: str) -> bool:
         """Whether break detection is configured for ``region``."""
         return region in self.enabled_regions
+
+
+#: Settings a per-station ``outliers.overrides.<MARKER>`` block may change.
+#: Validated at load time so a typo fails the run loudly, never silently
+#: (BGÓ Q4/Q9: floors and the abort fraction are explicitly per-station
+#: tunable; the window/threshold keys ride along for snow/latitude cases).
+OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
+    {
+        "scale_estimator",
+        "global_n_sigma",
+        "window_days",
+        "window_n_sigma",
+        "window_min_count",
+        "scale_floor",
+        "min_outlier_horizontal_mm",
+        "min_outlier_vertical_mm",
+        "max_run_days",
+        "cluster_gap_days",
+        "run_sign_fraction",
+        "step_evidence_sigma",
+        "step_window_days",
+        "max_flag_fraction",
+        "max_iterations",
+        "epoch_policy",
+    }
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class OutlierConfig:
+    """Outlier-detection settings (``outliers:`` block of ``analysis.yaml``).
+
+    Mirrors the :class:`BreakpointConfig` precedent: the leaf
+    (``gps_analysis.outliers``) stays config-free — this block is mapped
+    onto :class:`gps_analysis.OutlierParams` plus the per-component
+    magnitude-floor vector by :mod:`gps_api.precompute.outliers`. Global
+    defaults follow ``docs/DESIGN_outlier_detection.md`` §5.4/§6 (floors
+    5/5/10 mm H/H/V, ``max_flag_fraction`` 0.05); ``overrides`` carries
+    per-station replacements for any :data:`OUTLIER_OVERRIDE_KEYS` entry
+    (BGÓ Q4/Q9: floors and the abort fraction are station-tunable).
+
+    An absent ``outliers:`` block disables the stage (``enabled=False``,
+    the backwards-compatible default of :class:`AnalysisConfig`); a present
+    block enables it unless it says ``enabled: false``. ``protect_windows``
+    are operator intervals (fractional years) inside which flagging is
+    disabled outright (§3.4.3 — eruption onsets, dike intrusions).
+    """
+
+    enabled: bool = True
+    scale_estimator: str = "mad"
+    global_n_sigma: float = 5.0
+    window_days: float = 31.0
+    window_n_sigma: float = 4.0
+    window_min_count: int = 11
+    scale_floor: float = 0.0
+    min_outlier_horizontal_mm: float = 5.0
+    min_outlier_vertical_mm: float = 10.0
+    max_run_days: float = 2.0
+    cluster_gap_days: float = 1.5
+    run_sign_fraction: float = 0.8
+    step_evidence_sigma: float = 3.0
+    step_window_days: float = 10.0
+    max_flag_fraction: float = 0.05
+    max_iterations: int = 3
+    epoch_policy: str = "per_component"
+    protect_windows: tuple[tuple[float, float], ...] = ()
+    overrides: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Light structural validation only — gps_analysis.OutlierParams
+        # re-validates every threshold at call time (single source of truth).
+        if self.scale_estimator not in ("mad", "qn"):
+            raise ValueError(
+                f"outliers.scale_estimator must be 'mad' or 'qn', "
+                f"got {self.scale_estimator!r}"
+            )
+        if self.epoch_policy not in ("per_component", "union"):
+            raise ValueError(
+                "outliers.epoch_policy must be 'per_component' or 'union', "
+                f"got {self.epoch_policy!r}"
+            )
+        for key in ("min_outlier_horizontal_mm", "min_outlier_vertical_mm"):
+            if float(getattr(self, key)) < 0.0:
+                raise ValueError(f"outliers.{key} must be >= 0")
+        if not 0.0 < self.max_flag_fraction <= 1.0:
+            raise ValueError("outliers.max_flag_fraction must be in (0, 1]")
+        for t_a, t_b in self.protect_windows:
+            if t_b < t_a:
+                raise ValueError(
+                    f"outliers.protect_windows entry ({t_a}, {t_b}) has end < start"
+                )
+        for marker, body in self.overrides.items():
+            unknown = set(body) - OUTLIER_OVERRIDE_KEYS
+            if unknown:
+                raise ValueError(
+                    f"outliers.overrides.{marker}: unknown key(s) "
+                    f"{sorted(unknown)}; allowed: {sorted(OUTLIER_OVERRIDE_KEYS)}"
+                )
+
+    def settings_for(self, marker: str) -> dict[str, Any]:
+        """Resolved per-station settings: global defaults + station override."""
+        merged: dict[str, Any] = {
+            key: getattr(self, key) for key in sorted(OUTLIER_OVERRIDE_KEYS)
+        }
+        merged.update(self.overrides.get(marker, {}))
+        return merged
+
+    def as_dict(self) -> dict[str, Any]:
+        """JSON-ready mapping of the whole resolved block (hash/provenance)."""
+        payload = dataclasses.asdict(self)
+        payload["protect_windows"] = [list(w) for w in self.protect_windows]
+        return payload
+
+
+#: Component tags a ``steps.csv`` row may carry (``ALL`` = every component).
+STEP_COMPONENTS: tuple[str, ...] = ("N", "E", "U", "ALL")
+
+
+@dataclasses.dataclass(frozen=True)
+class StepRecord:
+    """One known step of one station (a ``steps.csv`` row).
+
+    The per-station step catalog (TOS equipment changes + skjálftalísa
+    coseismic offsets, manually seeded first — plan §10.4) that the
+    outlier-detection stage passes to ``detect_outliers(step_epochs=...)``
+    so the trajectory model absorbs known offsets instead of flagging them
+    (design §3.1 — the real-data SENG finding: a model without steps
+    over-flags real signal on active stations).
+    """
+
+    marker: str
+    epoch_yearf: float
+    component: str
+    kind: str = ""
+    source: str = ""
+    comment: str = ""
+
+    def applies_to(self, component_name: str) -> bool:
+        """Whether this step affects ``component_name`` (north/east/up)."""
+        return self.component == "ALL" or self.component == component_name[0].upper()
+
+
+def load_step_catalog(config_dir: Path) -> dict[str, tuple[StepRecord, ...]]:
+    """Read the deployed per-station step catalog (``<gpsconfig>/steps.csv``).
+
+    Format (template ``gpslibrary/config-templates/analysis-lane/steps.csv``):
+    ``sta,epoch_yearf,component,kind,source,comment`` with ``#`` comment
+    lines. A missing file returns an empty catalog — the caller decides how
+    loudly to warn (the precompute job prints the over-flagging risk).
+
+    Raises:
+        ValueError: On a malformed row (bad epoch, unknown component tag) —
+            a corrupt catalog must fail the run, not silently drop steps.
+    """
+    path = config_dir / "steps.csv"
+    if not path.is_file():
+        return {}
+    lines = [
+        line
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    catalog: dict[str, list[StepRecord]] = {}
+    for row in csv.DictReader(lines):
+        marker = str(row.get("sta") or "").strip()
+        if not marker:
+            raise ValueError(f"{path}: steps.csv row without a 'sta' marker: {row}")
+        component = str(row.get("component") or "ALL").strip().upper()
+        if component not in STEP_COMPONENTS:
+            raise ValueError(
+                f"{path}: station {marker}: component {component!r} — "
+                f"must be one of {STEP_COMPONENTS}"
+            )
+        try:
+            epoch = float(str(row.get("epoch_yearf")))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{path}: station {marker}: epoch_yearf "
+                f"{row.get('epoch_yearf')!r} is not a fractional year"
+            ) from None
+        catalog.setdefault(marker, []).append(
+            StepRecord(
+                marker=marker,
+                epoch_yearf=epoch,
+                component=component,
+                kind=str(row.get("kind") or "").strip(),
+                source=str(row.get("source") or "").strip(),
+                comment=str(row.get("comment") or "").strip(),
+            )
+        )
+    return {marker: tuple(records) for marker, records in catalog.items()}
 
 
 #: Velocity estimators the precompute job implements (Amendment A5).
@@ -325,6 +517,11 @@ class AnalysisConfig:
     deformation: DeformationConfig = dataclasses.field(
         default_factory=lambda: DeformationConfig(enabled_regions=())
     )
+    #: Outlier-detection stage settings; an absent ``outliers:`` block keeps
+    #: the stage disabled (backwards compatible — flags are opt-in config).
+    outliers: OutlierConfig = dataclasses.field(
+        default_factory=lambda: OutlierConfig(enabled=False)
+    )
     velocity_kappa_bounds: tuple[float, float] | None = None
     store_path: Path | None = None
     neu_dir: Path | None = None
@@ -445,6 +642,55 @@ def _parse_okada(body: dict[str, Any]) -> OkadaPlaneConfig | None:
     )
 
 
+def _parse_outliers(body: dict[str, Any]) -> OutlierConfig:
+    """Build the :class:`OutlierConfig` from an ``outliers:`` mapping.
+
+    An absent/empty block disables the stage; a present block enables it
+    unless it carries ``enabled: false``. ``min_outlier_mm`` follows the
+    design-§5.4 shape (``{horizontal, vertical}``); ``protect_windows`` are
+    ``{start, end, comment}`` mappings (comments are operator-facing and
+    dropped here — they stay in the deployed YAML).
+    """
+    if not body:
+        return OutlierConfig(enabled=False)
+    floors = _as_mapping(body.get("min_outlier_mm"), "outliers.min_outlier_mm")
+    windows: list[tuple[float, float]] = []
+    for i, window_raw in enumerate(body.get("protect_windows") or ()):
+        window = _as_mapping(window_raw, f"outliers.protect_windows[{i}]")
+        if "start" not in window or "end" not in window:
+            raise ValueError(
+                f"outliers.protect_windows[{i}] needs 'start' and 'end' "
+                f"(fractional years), got {window_raw!r}"
+            )
+        windows.append((float(window["start"]), float(window["end"])))
+    overrides_raw = _as_mapping(body.get("overrides"), "outliers.overrides")
+    overrides: dict[str, dict[str, Any]] = {}
+    for marker, override_raw in overrides_raw.items():
+        override = _as_mapping(override_raw, f"outliers.overrides.{marker}")
+        overrides[str(marker)] = dict(override)
+    return OutlierConfig(
+        enabled=bool(body.get("enabled", True)),
+        scale_estimator=str(body.get("scale_estimator", "mad")),
+        global_n_sigma=float(body.get("global_n_sigma", 5.0)),
+        window_days=float(body.get("window_days", 31.0)),
+        window_n_sigma=float(body.get("window_n_sigma", 4.0)),
+        window_min_count=int(body.get("window_min_count", 11)),
+        scale_floor=float(body.get("scale_floor", 0.0)),
+        min_outlier_horizontal_mm=float(floors.get("horizontal", 5.0)),
+        min_outlier_vertical_mm=float(floors.get("vertical", 10.0)),
+        max_run_days=float(body.get("max_run_days", 2.0)),
+        cluster_gap_days=float(body.get("cluster_gap_days", 1.5)),
+        run_sign_fraction=float(body.get("run_sign_fraction", 0.8)),
+        step_evidence_sigma=float(body.get("step_evidence_sigma", 3.0)),
+        step_window_days=float(body.get("step_window_days", 10.0)),
+        max_flag_fraction=float(body.get("max_flag_fraction", 0.05)),
+        max_iterations=int(body.get("max_iterations", 3)),
+        epoch_policy=str(body.get("epoch_policy", "per_component")),
+        protect_windows=tuple(windows),
+        overrides=overrides,
+    )
+
+
 def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
     """Load the analysis-lane configuration.
 
@@ -492,6 +738,7 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
     velocity = _as_mapping(raw.get("velocity"), "velocity")
     detrend = _as_mapping(raw.get("detrend"), "detrend")
     breaks = _as_mapping(raw.get("breakpoints"), "breakpoints")
+    outliers = _as_mapping(raw.get("outliers"), "outliers")
     deformation = _as_mapping(raw.get("deformation"), "deformation")
     bayes = _as_mapping(deformation.get("bayes"), "deformation.bayes")
     origin = _as_mapping(deformation.get("origin"), "deformation.origin")
@@ -561,6 +808,8 @@ def load_analysis_config(analysis_yaml: Path | None = None) -> AnalysisConfig:
             bayes_t_runs=int(bayes.get("t_runs", 100)),
             okada=okada_cfg,
         ),
+        # Outlier-detection stage (design §5.4): absent block → disabled.
+        outliers=_parse_outliers(outliers),
         # Optional κ search bounds for method="mle" regions (Amendment A5).
         velocity_kappa_bounds=_as_pair(
             velocity.get("kappa_bounds"), "velocity.kappa_bounds"

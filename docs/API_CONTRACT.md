@@ -48,7 +48,7 @@
 |---|---|---|---|---|
 | GET | `/healthz` | `{"status","version"}` | live | liveness probe (unversioned) |
 | GET | `/v1/stations` | `StationCollection` (GeoJSON) | **wired** | cacheable catalog; fleet runs span all regions, `properties.regions` merged |
-| GET | `/v1/stations/{marker}/series` | `SeriesResponse` | **wired** | `start`, `end`, `max_points` (target count, LTTB), `detrended` params; server-side ceiling — see Amendment A3 |
+| GET | `/v1/stations/{marker}/series` | `SeriesResponse` | **wired** | `start`, `end`, `max_points` (target count, LTTB), `detrended`, `clean` params; server-side ceiling — see Amendments A3, A8 |
 | GET | `/v1/velocities` | `VelocityCollection` (GeoJSON) | **wired** | `region`, `window_years` filters |
 | GET | `/v1/models/{region}` | `ModelResult` | **wired** | latest model products; `kind="breakpoints"` (GBIS4TS) first — see Amendment A2; the `"mogi"` kind stays reserved (the live Mogi product moved to `/v1/deformation`) |
 | GET | `/v1/models/{region}/history` | `ModelHistory` | 501 | fit time-lapse; reserved in v0 (Decisions #5), needs run accumulation (Postgres slice) |
@@ -219,8 +219,56 @@ changed in the same commit (the two are always changed together).
   Green's/Laplacian operators — not exact for patches pinned by the
   non-negativity constraint (the provenance says so).
 
+## Amendments (outlier-detection wiring, 2026-07-13)
+
+Additive change landed with the `wire-outlier-detection` slice; `schemas.py`
+changed in the same commit (the two are always changed together).
+
+- **A8 — `GET /v1/stations/{marker}/series`: outlier flags + the `clean`
+  parameter.** The precompute job runs model-aware outlier detection
+  (`gps_analysis.detect_outliers` — Hampel + global identifiers on
+  studentized residuals of a Huber **step-augmented** trajectory fit, with a
+  signal-protection stage; `gps_analysis/docs/DESIGN_outlier_detection.md`)
+  when `analysis.yaml` carries an `outliers:` block (`--no-outliers` skips
+  it). The result is **non-destructive by construction**:
+  - The store's raw Parquet columns stay **byte-identical**; the flags ride
+    as additive columns (`<component>_outlier` bool,
+    `<component>_outlier_reason` / `<component>_outlier_protected` uint8
+    bitmasks, `outlier_epoch` bool union) plus an `outliers` provenance
+    object (method tag `"hampel-trajectory"`, the full `OutlierParams` echo,
+    per-component flag/candidate/protected counts, suspected events, abort
+    state, `params_hash`).
+  - New query parameter **`clean: bool = false`**. The default serves the
+    **raw** series — every stored epoch, each carrying the per-epoch
+    `outlier` union flag (nullable: `null` on products predating the
+    feature). `clean=true` drops the flagged epochs **before** LTTB
+    downsampling (outlier spikes otherwise dominate the triangle
+    selection — the exact plotting artifact aflogun must avoid).
+    `detrended` composes with either (detrended values exist at all
+    epochs). **The default stays raw deliberately**: real-data verification
+    (active-deformation SENG vs quiet HOFN) showed detection quality is
+    bounded by the trajectory model, so residual over-flagging on active
+    stations must stay visible and reversible, never silently clipped.
+  - `SeriesResponse` gains `clean` (echo), `outlier` (per served epoch,
+    union over components) and `outlier_provenance` (the store's
+    `outliers` object) — all nullable/defaulted, pre-A8 payloads unchanged.
+  - Detection is model-aware: the precompute passes per-station
+    `step_epochs` from the deployed step catalog (`steps.csv` — TOS
+    equipment + skjálftalísa coseismic) so known offsets are absorbed, not
+    flagged. Downstream estimates (velocity, GBIS4TS breaks, deformation)
+    fit on the **inliers**; the breaks product provenance records the
+    outlier-params hash it consumed (`provenance.outliers.params_hash`).
+  - Run bookkeeping (`meta/run.json`): `outliers_aborted` (stations whose
+    detection hit the >`max_flag_fraction` candidate abort — they proceed
+    **unmasked**, loudly) and `outliers_failed` (stations whose detection
+    raised — fault-tolerant, station products survive). The protected
+    suspected-event clusters are written to `meta/suspected_steps.csv`
+    for operator review (candidate `steps.csv` entries) — a primary
+    deliverable of the stage, not a debug artifact.
+
 ---
 
 *Drafted + reviewed 2026-07-08 (Phase 0). Amended 2026-07-11 (fleet slice:
 endpoint statuses, A1–A4); 2026-07-12 (Mogi + MLE productization, A5–A6;
-Okada distributed-slip productization, A7). Owner: BGÓ.*
+Okada distributed-slip productization, A7); 2026-07-13 (outlier-detection
+wiring, A8). Owner: BGÓ.*
