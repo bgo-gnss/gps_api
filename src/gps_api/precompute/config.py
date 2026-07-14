@@ -99,6 +99,11 @@ class BreakpointConfig:
 #: Validated at load time so a typo fails the run loudly, never silently
 #: (BGÓ Q4/Q9: floors and the abort fraction are explicitly per-station
 #: tunable; the window/threshold keys ride along for snow/latitude cases).
+#: The active-station levers (``despike``/``window_order``/
+#: ``window_robust_iterations``/``despike_n_sigma``) mirror the columns of
+#: geo_dataread's ``outlier_overrides.csv`` — field parity so the store's
+#: cleaned series and the internal ``_cleaned.NEU`` path CAN be configured
+#: identically.
 OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
     {
         "scale_estimator",
@@ -106,6 +111,10 @@ OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "window_days",
         "window_n_sigma",
         "window_min_count",
+        "window_order",
+        "window_robust_iterations",
+        "despike",
+        "despike_n_sigma",
         "scale_floor",
         "min_outlier_horizontal_mm",
         "min_outlier_vertical_mm",
@@ -119,6 +128,10 @@ OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "epoch_policy",
     }
 )
+
+#: Valid ``window_order`` values (0 = constant, 1 = local linear, 2 = quad) —
+#: mirrors :data:`gps_analysis.OutlierParams` and geo_dataread's catalog gate.
+WINDOW_ORDERS: tuple[int, ...] = (0, 1, 2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,6 +160,18 @@ class OutlierConfig:
     window_days: float = 31.0
     window_n_sigma: float = 4.0
     window_min_count: int = 11
+    #: Robust local-polynomial identifier order (design §3.2: 0 = constant —
+    #: today's behavior, 1 = local linear, 2 = quadratic) + its bisquare
+    #: re-weighting count; Stage-0 gross-blunder despike (design §3.0
+    #: addendum, off by default) + its threshold. Defaults mirror
+    #: :class:`gps_analysis.OutlierParams` exactly so an absent key
+    #: reproduces the pre-lever masks byte-identically; per-station
+    #: ``overrides`` may set any of them (field parity with geo_dataread's
+    #: ``outlier_overrides.csv`` — the ``_cleaned.NEU`` path).
+    window_order: int = 0
+    window_robust_iterations: int = 2
+    despike: bool = False
+    despike_n_sigma: float = 10.0
     scale_floor: float = 0.0
     min_outlier_horizontal_mm: float = 5.0
     min_outlier_vertical_mm: float = 10.0
@@ -174,6 +199,12 @@ class OutlierConfig:
                 "outliers.epoch_policy must be 'per_component' or 'union', "
                 f"got {self.epoch_policy!r}"
             )
+        if self.window_order not in WINDOW_ORDERS:
+            raise ValueError(
+                f"outliers.window_order must be one of {WINDOW_ORDERS} "
+                f"(0 = constant, 1 = local linear, 2 = quadratic), "
+                f"got {self.window_order!r}"
+            )
         for key in ("min_outlier_horizontal_mm", "min_outlier_vertical_mm"):
             if float(getattr(self, key)) < 0.0:
                 raise ValueError(f"outliers.{key} must be >= 0")
@@ -190,6 +221,14 @@ class OutlierConfig:
                 raise ValueError(
                     f"outliers.overrides.{marker}: unknown key(s) "
                     f"{sorted(unknown)}; allowed: {sorted(OUTLIER_OVERRIDE_KEYS)}"
+                )
+            # The enum lever fails at LOAD time, not detection time — a bad
+            # per-station value would otherwise only surface inside the
+            # fault-tolerant detection loop (recorded, station unmasked).
+            if "window_order" in body and body["window_order"] not in WINDOW_ORDERS:
+                raise ValueError(
+                    f"outliers.overrides.{marker}.window_order must be one "
+                    f"of {WINDOW_ORDERS}, got {body['window_order']!r}"
                 )
 
     def settings_for(self, marker: str) -> dict[str, Any]:
@@ -828,6 +867,13 @@ def _parse_outliers(body: dict[str, Any]) -> OutlierConfig:
         window_days=float(body.get("window_days", 31.0)),
         window_n_sigma=float(body.get("window_n_sigma", 4.0)),
         window_min_count=int(body.get("window_min_count", 11)),
+        # Active-station levers (leaf §3.0/§3.2) — defaults mirror
+        # gps_analysis.OutlierParams: absent keys keep despike OFF and the
+        # constant (order-0) window, i.e. today's masks byte-identically.
+        window_order=int(body.get("window_order", 0)),
+        window_robust_iterations=int(body.get("window_robust_iterations", 2)),
+        despike=bool(body.get("despike", False)),
+        despike_n_sigma=float(body.get("despike_n_sigma", 10.0)),
         scale_floor=float(body.get("scale_floor", 0.0)),
         min_outlier_horizontal_mm=float(floors.get("horizontal", 5.0)),
         min_outlier_vertical_mm=float(floors.get("vertical", 10.0)),

@@ -164,7 +164,9 @@ def _loader(marker: str) -> StationSeries:
         y[0, ELDC_SPIKE_NORTH] += 25.0  # identical spike, huge floors
     elif marker == "SKSH":
         for day in SKSH_RUN_DAYS:
-            y[0, day] += 15.0  # sustained one-sided run -> protected
+            # Return-to-baseline run -> blunder cluster, FLAGGED since the
+            # leaf's run-protection release (gps_analysis 3d05812).
+            y[0, day] += 15.0
     elif marker == "VONC":
         y[:, VONC_STEP_DAY:] += 60.0  # UNDECLARED step -> abort
     return StationSeries(
@@ -347,7 +349,14 @@ def test_undeclared_step_aborts_loud_never_masks(store_on: Path) -> None:
 
 
 def test_suspected_steps_csv_written_for_operator_review(store_on: Path) -> None:
-    """BGÓ requirement #4 / Q5: the protected clusters land in meta/."""
+    """BGÓ requirement #4 / Q5: the protected clusters land in meta/.
+
+    Re-pinned 2026-07-14 to the leaf's run-protection release
+    (gps_analysis 3d05812, design §3.4 update): a sustained one-sided run
+    that RETURNS to baseline is a blunder cluster and is now FLAGGED — so
+    SKSH's 5-day run no longer appears as a protected event; the aborted
+    VONC station's undeclared-step clusters remain the CSV's payload.
+    """
     path = store_on / "meta" / "suspected_steps.csv"
     assert path.is_file()
     with path.open() as handle:
@@ -356,25 +365,25 @@ def test_suspected_steps_csv_written_for_operator_review(store_on: Path) -> None
         rows = list(reader)
     assert rows, "no suspected events recorded at all"
     assert all(row["region"] == REGION for row in rows)
-    # SKSH's sustained 5-day run is surfaced as a protected event.
-    sksh = [r for r in rows if r["sta"] == "SKSH" and r["component"] == "north"]
-    assert sksh, "SKSH transient run missing from suspected_steps.csv"
-    run_start = T0 + min(SKSH_RUN_DAYS) / 365.25
-    run_end = T0 + max(SKSH_RUN_DAYS) / 365.25
-    event = sksh[0]
-    assert event["kind"] in ("transient_run", "step")
-    assert float(event["t_start_yearf"]) == pytest.approx(run_start, abs=5 / 365.25)
-    assert float(event["t_end_yearf"]) == pytest.approx(run_end, abs=5 / 365.25)
-    assert event["sign"] == "1"
-    assert event["station_aborted"] == "false"
-    assert event["start_time"].endswith("Z")
-    # VONC's undeclared step shows up too, marked as an aborted station.
+    assert all(row["start_time"].endswith("Z") for row in rows if row["start_time"])
+    # VONC's undeclared step shows up, marked as an aborted station, and at
+    # least one evidence-bearing cluster brackets the injected step epoch.
     vonc = [r for r in rows if r["sta"] == "VONC"]
     assert vonc, "aborted VONC left no suspected-event trace"
     assert all(r["station_aborted"] == "true" for r in vonc)
-    # SKSH's run was protected — NOT flagged (signal, not blunder).
+    step_yearf = T0 + VONC_STEP_DAY / 365.25
+    evidenced = [r for r in vonc if r["step_evidence"]]
+    assert evidenced, "no step-evidence clusters for the undeclared VONC step"
+    assert any(
+        float(r["t_start_yearf"]) - 5 / 365.25
+        <= step_yearf
+        <= float(r["t_end_yearf"]) + 5 / 365.25
+        for r in evidenced
+    )
+    # SKSH's return-to-baseline run is a BLUNDER cluster under the released
+    # run protection — flagged, not surfaced as a suspected event.
     north = _flags(store_on, "SKSH", "north_outlier")
-    assert not north[list(SKSH_RUN_DAYS)].any()
+    assert north[list(SKSH_RUN_DAYS)].all()
 
 
 # ---------------------------------------------------------------------------

@@ -223,6 +223,12 @@ def station_outlier_params(
     every threshold) and the per-component magnitude floors a_min in
     :data:`COMPONENTS` order — ``(horizontal, horizontal, vertical)`` mm
     (design §3.4.1; defaults 5/5/10 mm, per-station overridable — BGÓ Q4).
+
+    The active-station levers (Stage-0 ``despike`` + the robust
+    local-polynomial identifier ``window_order``/``window_robust_iterations``
+    + ``despike_n_sigma``) map through 1:1 — field parity with the
+    ``outlier_overrides.csv`` path geo_dataread's ``_cleaned.NEU`` writer
+    resolves, so the store's cleaned series can be configured identically.
     """
     settings = ocfg.settings_for(marker)
     params = OutlierParams(
@@ -231,6 +237,10 @@ def station_outlier_params(
         window_days=float(settings["window_days"]),
         window_n_sigma=float(settings["window_n_sigma"]),
         window_min_count=int(settings["window_min_count"]),
+        window_order=int(settings["window_order"]),
+        window_robust_iterations=int(settings["window_robust_iterations"]),
+        despike=bool(settings["despike"]),
+        despike_n_sigma=float(settings["despike_n_sigma"]),
         scale_floor=float(settings["scale_floor"]),
         max_run_days=float(settings["max_run_days"]),
         cluster_gap_days=float(settings["cluster_gap_days"]),
