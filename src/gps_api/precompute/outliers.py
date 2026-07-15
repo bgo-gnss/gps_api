@@ -36,9 +36,10 @@ from gps_analysis import (
     remove_trend,
     with_steps,
 )
+from gps_parser.outlier_catalogs import StationOutlierOverride
 from numpy.typing import NDArray
 
-from gps_api.precompute.config import OutlierConfig, StepRecord
+from gps_api.precompute.config import OUTLIER_OVERRIDE_KEYS, OutlierConfig, StepRecord
 from gps_api.precompute.sources import (
     COMPONENTS,
     FloatArray,
@@ -215,22 +216,34 @@ def config_hash(ocfg: OutlierConfig) -> str:
 
 
 def station_outlier_params(
-    ocfg: OutlierConfig, marker: str
+    ocfg: OutlierConfig,
+    marker: str,
+    *,
+    override: StationOutlierOverride | None = None,
 ) -> tuple[OutlierParams, tuple[float, float, float]]:
     """Map the config block to the leaf's thresholds for one station.
 
     Returns the :class:`gps_analysis.OutlierParams` (which re-validates
     every threshold) and the per-component magnitude floors a_min in
-    :data:`COMPONENTS` order — ``(horizontal, horizontal, vertical)`` mm
-    (design §3.4.1; defaults 5/5/10 mm, per-station overridable — BGÓ Q4).
+    :data:`COMPONENTS` order (design §3.4.1; defaults 5/5/10 mm).
 
-    The active-station levers (Stage-0 ``despike`` + the robust
-    local-polynomial identifier ``window_order``/``window_robust_iterations``
-    + ``despike_n_sigma``) map through 1:1 — field parity with the
-    ``outlier_overrides.csv`` path geo_dataread's ``_cleaned.NEU`` writer
-    resolves, so the store's cleaned series can be configured identically.
+    Authority split (design ``gps_parser/docs/DESIGN_shared_outlier_config.md``
+    §2): the yaml block supplies the fleet-wide GLOBAL defaults; the deployed
+    ``outlier_overrides.csv`` (read through the shared
+    :mod:`gps_parser.outlier_catalogs` resolver — the SAME source geo_dataread's
+    ``_cleaned.NEU`` path reads) supplies the per-station levers + floor. An
+    ``override`` here is that station's CSV row: its ``fields`` (despike,
+    ``window_order``/``window_robust_iterations``, ``epoch_policy``,
+    ``despike_n_sigma``) apply on top of the globals, and its per-component
+    ``[N, E, U]`` ``min_outlier`` wins over the global
+    ``(horizontal, horizontal, vertical)`` broadcast (the floor-collapse fix —
+    a genuine per-component vector, no longer forced to N==E).
     """
-    settings = ocfg.settings_for(marker)
+    settings: dict[str, Any] = {
+        key: getattr(ocfg, key) for key in OUTLIER_OVERRIDE_KEYS
+    }
+    if override is not None:
+        settings.update(override.fields)  # per-station CSV levers over globals
     params = OutlierParams(
         scale_estimator=str(settings["scale_estimator"]),
         global_n_sigma=float(settings["global_n_sigma"]),
@@ -251,9 +264,17 @@ def station_outlier_params(
         max_iterations=int(settings["max_iterations"]),
         epoch_policy=str(settings["epoch_policy"]),
     )
-    horizontal = float(settings["min_outlier_horizontal_mm"])
-    vertical = float(settings["min_outlier_vertical_mm"])
-    return params, (horizontal, horizontal, vertical)
+    if override is not None and override.min_outlier is not None:
+        floors = (
+            float(override.min_outlier[0]),
+            float(override.min_outlier[1]),
+            float(override.min_outlier[2]),
+        )
+    else:
+        horizontal = float(settings["min_outlier_horizontal_mm"])
+        vertical = float(settings["min_outlier_vertical_mm"])
+        floors = (horizontal, horizontal, vertical)
+    return params, floors
 
 
 def component_step_epochs(
@@ -300,8 +321,17 @@ def detect_station_outliers(
     model: Any,
     ocfg: OutlierConfig,
     steps: tuple[StepRecord, ...],
+    *,
+    override: StationOutlierOverride | None = None,
+    protect_windows: tuple[tuple[float, float], ...] = (),
 ) -> StationOutliers:
     """Run the leaf detection for one station with its step catalog.
+
+    ``override`` is the station's ``outlier_overrides.csv`` row and
+    ``protect_windows`` its ``protect_windows.csv`` intervals — both read
+    through the shared :mod:`gps_parser.outlier_catalogs` resolver (the SAME
+    deployed catalogs geo_dataread's ``_cleaned.NEU`` path reads), so the
+    store's mask and the internal ``.NEU`` mask are configured from one source.
 
     The step-augmented model inputs are built here (the empirical hard
     requirement — see module docstring): when every component shares one
@@ -316,7 +346,7 @@ def detect_station_outliers(
         step-augmented all-epoch detrended residuals, suspected-event rows,
         and the parameter echo for provenance.
     """
-    params, floors = station_outlier_params(ocfg, series.marker)
+    params, floors = station_outlier_params(ocfg, series.marker, override=override)
     step_lists = component_step_epochs(steps)
     floors_arr = np.asarray(floors, dtype=np.float64)
     component_of = dict(enumerate(COMPONENTS))
@@ -329,7 +359,7 @@ def detect_station_outliers(
             series.y,
             series.sigma,
             step_epochs=epochs if epochs.size else None,
-            protect_windows=ocfg.protect_windows,
+            protect_windows=protect_windows,
             min_outlier=floors_arr,
             params=params,
             names=COMPONENTS,
@@ -375,7 +405,7 @@ def detect_station_outliers(
             series.y[i],
             None if series.sigma is None else series.sigma[i],
             step_epochs=epochs if epochs.size else None,
-            protect_windows=ocfg.protect_windows,
+            protect_windows=protect_windows,
             min_outlier=floors_arr[i],
             params=params,
             names=[component],

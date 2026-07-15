@@ -126,16 +126,20 @@ outliers:
   min_outlier_mm:
     horizontal: 5.0
     vertical: 10.0
-  overrides:
-    ELDC:
-      min_outlier_horizontal_mm: 1000.0
-      min_outlier_vertical_mm: 1000.0
 """
 
 STEPS_CSV = f"""\
 # steps.csv test fixture — SENG's step is DECLARED; VONC's is not.
 sta,epoch_yearf,component,kind,source,comment
 SENG,{SENG_STEP_YEARF:.6f},ALL,equipment,manual,test antenna swap
+"""
+
+# Per-station tuning now lives in the deployed CSV (design §2 authority split),
+# not analysis.yaml: ELDC gets huge per-component floors so its spike is NOT
+# flagged (the same lever geo_dataread's _cleaned.NEU path resolves).
+OUTLIER_OVERRIDES_CSV = """\
+sta,min_outlier_n,min_outlier_e,min_outlier_u
+ELDC,1000,1000,1000
 """
 
 
@@ -185,6 +189,7 @@ def config_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     (config_dir / "postprocess.cfg").write_text(POSTPROCESS_CFG)
     (config_dir / "analysis.yaml").write_text(ANALYSIS_YAML)
     (config_dir / "steps.csv").write_text(STEPS_CSV)
+    (config_dir / "outlier_overrides.csv").write_text(OUTLIER_OVERRIDES_CSV)
     return config_dir
 
 
@@ -549,3 +554,20 @@ def test_series_clean_composes_with_detrended(client_on: TestClient) -> None:
     # declared 40 mm step must not survive into the residuals.
     north = np.asarray(series.north)
     assert float(np.abs(north).max()) < 25.0  # step (40) gone, spikes dropped
+
+
+def test_floor_override_no_longer_collapses_n_e() -> None:
+    """station_outlier_params emits an independent [N,E,U] floor (collapse fix)."""
+    from gps_parser.outlier_catalogs import StationOutlierOverride
+
+    from gps_api.precompute.config import OutlierConfig
+    from gps_api.precompute.outliers import station_outlier_params
+
+    ocfg = OutlierConfig()  # H/V global default 5/10
+    # no override: broadcasts to (H, H, V) — unchanged behavior
+    _, floors = station_outlier_params(ocfg, "SENG")
+    assert floors == (5.0, 5.0, 10.0)
+    # CSV override path: independent N != E honored, not collapsed
+    override = StationOutlierOverride(fields={}, min_outlier=(4.0, 7.0, 15.0))
+    _, floors2 = station_outlier_params(ocfg, "SENG", override=override)
+    assert floors2 == (4.0, 7.0, 15.0)

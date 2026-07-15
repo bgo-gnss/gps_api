@@ -10,7 +10,9 @@ identically. Pinned here:
 
 - defaults mirror :class:`gps_analysis.OutlierParams` exactly — an absent
   key reproduces today's behavior (despike off, constant window);
-- the new keys parse from ``analysis.yaml`` globally AND per-station;
+- the new keys parse from ``analysis.yaml`` as fleet-wide GLOBALS, and a
+  per-station ``outlier_overrides.csv`` row (the shared resolver — the SAME
+  source geo_dataread reads, design §2) overrides them;
 - a station configured ``despike: true, window_order: 1`` actually runs
   the leaf with those params (echoed in provenance, ``params_hash``
   differs from the default);
@@ -24,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from gps_analysis import OutlierParams, lineperiodic
+from gps_parser.outlier_catalogs import StationOutlierOverride
 
 from gps_api.precompute.config import (
     OutlierConfig,
@@ -78,13 +81,20 @@ outliers:
   window_robust_iterations: 3
   despike: true
   despike_n_sigma: 6.0
-  overrides:
-    ELDC:
-      despike: false
-      window_order: 2
-      window_robust_iterations: 1
-      despike_n_sigma: 12.0
 """
+
+# Per-station levers now live in the deployed CSV (design §2), not the yaml —
+# ELDC turns despike back off + bumps the window order (the same row shape
+# geo_dataread's _cleaned.NEU path resolves).
+ELDC_OVERRIDE = StationOutlierOverride(
+    fields={
+        "despike": False,
+        "window_order": 2,
+        "window_robust_iterations": 1,
+        "despike_n_sigma": 12.0,
+    },
+    min_outlier=None,
+)
 
 
 @pytest.fixture()
@@ -134,14 +144,14 @@ def test_levers_parse_from_yaml_globally_and_per_station(
     assert ocfg.window_order == 1
     assert ocfg.window_robust_iterations == 3
     assert ocfg.despike_n_sigma == 6.0
-    # ...reach an unoverridden station's OutlierParams 1:1...
+    # ...reach a station with no CSV override 1:1...
     seng, _ = station_outlier_params(ocfg, "SENG")
     assert seng.despike is True
     assert seng.window_order == 1
     assert seng.window_robust_iterations == 3
     assert seng.despike_n_sigma == 6.0
-    # ...and the per-station override wins on every new key (precedence).
-    eldc, _ = station_outlier_params(ocfg, "ELDC")
+    # ...and the per-station CSV override wins on every new key (precedence).
+    eldc, _ = station_outlier_params(ocfg, "ELDC", override=ELDC_OVERRIDE)
     assert eldc.despike is False
     assert eldc.window_order == 2
     assert eldc.window_robust_iterations == 1
@@ -151,13 +161,12 @@ def test_levers_parse_from_yaml_globally_and_per_station(
 def test_new_keys_flow_into_config_dict_for_provenance(
     gpsconfig_levers: Path,
 ) -> None:
-    """``as_dict`` (the config-hash / provenance input) carries the levers."""
+    """``as_dict`` (the config-hash / provenance input) carries the globals."""
     payload = load_analysis_config().outliers.as_dict()
     assert payload["despike"] is True
     assert payload["window_order"] == 1
     assert payload["window_robust_iterations"] == 3
     assert payload["despike_n_sigma"] == 6.0
-    assert payload["overrides"]["ELDC"]["window_order"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +190,22 @@ def test_window_order_out_of_range_rejected_in_override() -> None:
 def test_unknown_override_key_still_rejected() -> None:
     with pytest.raises(ValueError, match="unknown key"):
         OutlierConfig(overrides={"SENG": {"despike_gap_days": 2.0}})
+
+
+def test_deprecated_per_station_keys_flagged_for_job_warning() -> None:
+    """The guard the job uses to warn on stale yaml per-station config
+    (authority moved to the CSVs — design §2)."""
+    assert OutlierConfig().deprecated_per_station_keys() is False
+    assert (
+        OutlierConfig(overrides={"SENG": {"despike": True}})
+        .deprecated_per_station_keys()
+        is True
+    )
+    assert (
+        OutlierConfig(protect_windows=((2023.9, 2024.1),))
+        .deprecated_per_station_keys()
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +238,15 @@ def _series(marker: str) -> StationSeries:
 def test_station_override_runs_leaf_with_levers_and_hash_differs() -> None:
     """despike=true + window_order=1 reach the leaf; params_hash moves."""
     default_cfg = OutlierConfig()
-    lever_cfg = OutlierConfig(overrides={"SENG": {"despike": True, "window_order": 1}})
+    lever = StationOutlierOverride(
+        fields={"despike": True, "window_order": 1}, min_outlier=None
+    )
     series = _series("SENG")
 
     baseline = detect_station_outliers(series, lineperiodic, default_cfg, ())
-    levered = detect_station_outliers(series, lineperiodic, lever_cfg, ())
+    levered = detect_station_outliers(
+        series, lineperiodic, default_cfg, (), override=lever
+    )
 
     # The leaf ran with the overridden params — echoed straight through.
     assert levered.params.despike is True
@@ -233,7 +262,7 @@ def test_station_override_runs_leaf_with_levers_and_hash_differs() -> None:
     assert provenance["params"]["window_robust_iterations"] == 2
     assert baseline.provenance()["params"]["despike"] is False
     assert levered.params_hash != baseline.params_hash
-    # A station WITHOUT the override resolves to the default params — its
+    # A station WITHOUT an override resolves to the default params — its
     # mask (and hash) is untouched by another station's lever.
-    other = detect_station_outliers(_series("ELDC"), lineperiodic, lever_cfg, ())
+    other = detect_station_outliers(_series("ELDC"), lineperiodic, default_cfg, ())
     assert other.params == OutlierParams()

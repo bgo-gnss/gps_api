@@ -106,6 +106,8 @@ from gps_api.precompute.config import (
     DeformationConfig,
     StationMeta,
     load_analysis_config,
+    load_outlier_overrides,
+    load_protect_windows,
     load_station_meta,
     load_step_catalog,
 )
@@ -698,6 +700,21 @@ def run_precompute(
     step_catalog = (
         load_step_catalog(cfg.config_dir) if (outliers_on or detrend_on) else {}
     )
+    # Per-station outlier levers + protect windows — the deployed CSVs (design
+    # §2 authority split: the SAME source geo_dataread's _cleaned.NEU reads;
+    # yaml carries only the fleet-wide globals).
+    outlier_overrides = load_outlier_overrides(cfg.config_dir) if outliers_on else {}
+    protect_windows = load_protect_windows(cfg.config_dir) if outliers_on else {}
+    if outliers_on and cfg.outliers.deprecated_per_station_keys():
+        print(
+            f"[region {region.name}] outliers: analysis.yaml carries "
+            "per-station outliers.overrides / outliers.protect_windows — these "
+            "are DEPRECATED and IGNORED; per-station tuning now lives in the "
+            "deployed outlier_overrides.csv / protect_windows.csv (the single "
+            "source geo_dataread's _cleaned.NEU path also reads). Move them there.",
+            file=sys.stderr,
+            flush=True,
+        )
     if outliers_on and not step_catalog:
         # The real-data finding (SENG): a stepless trajectory model
         # over-flags real signal on active stations — say so up front.
@@ -782,6 +799,8 @@ def run_precompute(
                         _MODEL_FUNCS[model_name],
                         cfg.outliers,
                         step_catalog.get(marker, ()),
+                        override=outlier_overrides.get(marker),
+                        protect_windows=protect_windows.get(marker, ()),
                     )
                 except Exception as exc:  # noqa: BLE001 — station proceeds unmasked
                     outliers_failed[marker] = f"{type(exc).__name__}: {exc}"

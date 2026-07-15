@@ -23,13 +23,17 @@ at this boundary and coerced to concrete types immediately.
 
 from __future__ import annotations
 
-import csv
 import dataclasses
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
+from gps_parser import outlier_catalogs as _oc
+
+# Re-exported for downstream precompute modules (explicit `as` = mypy export).
+from gps_parser.outlier_catalogs import StationOutlierOverride as StationOutlierOverride
+from gps_parser.outlier_catalogs import StepRecord as StepRecord
 
 
 def _gpsconfig() -> Any:
@@ -231,13 +235,15 @@ class OutlierConfig:
                     f"of {WINDOW_ORDERS}, got {body['window_order']!r}"
                 )
 
-    def settings_for(self, marker: str) -> dict[str, Any]:
-        """Resolved per-station settings: global defaults + station override."""
-        merged: dict[str, Any] = {
-            key: getattr(self, key) for key in sorted(OUTLIER_OVERRIDE_KEYS)
-        }
-        merged.update(self.overrides.get(marker, {}))
-        return merged
+    def deprecated_per_station_keys(self) -> bool:
+        """True if yaml carries per-station keys the job now IGNORES.
+
+        Authority moved to the deployed CSVs (design §2): per-station tuning
+        lives in ``outlier_overrides.csv`` / ``protect_windows.csv`` (the SAME
+        source geo_dataread reads). The job checks this to warn loudly rather
+        than silently drop an operator's stale ``analysis.yaml`` intent.
+        """
+        return bool(self.overrides or self.protect_windows)
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-ready mapping of the whole resolved block (hash/provenance)."""
@@ -393,83 +399,63 @@ class DetrendConfig:
         return payload
 
 
-#: Component tags a ``steps.csv`` row may carry (``ALL`` = every component).
-STEP_COMPONENTS: tuple[str, ...] = ("N", "E", "U", "ALL")
-
-
-@dataclasses.dataclass(frozen=True)
-class StepRecord:
-    """One known step of one station (a ``steps.csv`` row).
-
-    The per-station step catalog (TOS equipment changes + skjálftalísa
-    coseismic offsets, manually seeded first — plan §10.4) that the
-    outlier-detection stage passes to ``detect_outliers(step_epochs=...)``
-    so the trajectory model absorbs known offsets instead of flagging them
-    (design §3.1 — the real-data SENG finding: a model without steps
-    over-flags real signal on active stations).
-    """
-
-    marker: str
-    epoch_yearf: float
-    component: str
-    kind: str = ""
-    source: str = ""
-    comment: str = ""
-
-    def applies_to(self, component_name: str) -> bool:
-        """Whether this step affects ``component_name`` (north/east/up)."""
-        return self.component == "ALL" or self.component == component_name[0].upper()
+# ``StepRecord`` + ``STEP_COMPONENTS`` are re-exported from the shared
+# gps_parser resolver (the single source geo_dataread also reads) — same
+# per-component record, one parser, one format vocabulary.
 
 
 def load_step_catalog(config_dir: Path) -> dict[str, tuple[StepRecord, ...]]:
     """Read the deployed per-station step catalog (``<gpsconfig>/steps.csv``).
 
-    Format (template ``gpslibrary/config-templates/analysis-lane/steps.csv``):
-    ``sta,epoch_yearf,component,kind,source,comment`` with ``#`` comment
-    lines. A missing file returns an empty catalog — the caller decides how
+    Delegates parsing to :func:`gps_parser.outlier_catalogs.read_steps` (the
+    single source geo_dataread's ``_cleaned.NEU`` path reads too — no second
+    parser). A missing file returns an empty catalog; the caller decides how
     loudly to warn (the precompute job prints the over-flagging risk).
 
     Raises:
         ValueError: On a malformed row (bad epoch, unknown component tag) —
             a corrupt catalog must fail the run, not silently drop steps.
     """
-    path = config_dir / "steps.csv"
+    path = config_dir / _oc.STEPS_FILENAME
     if not path.is_file():
         return {}
-    lines = [
-        line
-        for line in path.read_text().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    catalog: dict[str, list[StepRecord]] = {}
-    for row in csv.DictReader(lines):
-        marker = str(row.get("sta") or "").strip()
-        if not marker:
-            raise ValueError(f"{path}: steps.csv row without a 'sta' marker: {row}")
-        component = str(row.get("component") or "ALL").strip().upper()
-        if component not in STEP_COMPONENTS:
-            raise ValueError(
-                f"{path}: station {marker}: component {component!r} — "
-                f"must be one of {STEP_COMPONENTS}"
-            )
-        try:
-            epoch = float(str(row.get("epoch_yearf")))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"{path}: station {marker}: epoch_yearf "
-                f"{row.get('epoch_yearf')!r} is not a fractional year"
-            ) from None
-        catalog.setdefault(marker, []).append(
-            StepRecord(
-                marker=marker,
-                epoch_yearf=epoch,
-                component=component,
-                kind=str(row.get("kind") or "").strip(),
-                source=str(row.get("source") or "").strip(),
-                comment=str(row.get("comment") or "").strip(),
-            )
-        )
-    return {marker: tuple(records) for marker, records in catalog.items()}
+    return cast("dict[str, tuple[StepRecord, ...]]", _oc.read_steps(path))
+
+
+def load_outlier_overrides(config_dir: Path) -> dict[str, StationOutlierOverride]:
+    """Read the deployed per-station outlier-override catalog.
+
+    The per-station detection levers + magnitude floors — the deployed
+    ``outlier_overrides.csv``, read through the shared resolver (the SAME
+    source geo_dataread's ``_cleaned.NEU`` path reads; design §2 authority
+    split — per-station tuning lives in the CSV, not ``analysis.yaml``). A
+    missing file returns an empty catalog (all stations use the yaml globals).
+    """
+    path = config_dir / _oc.OUTLIER_OVERRIDES_FILENAME
+    if not path.is_file():
+        return {}
+    return cast(
+        "dict[str, StationOutlierOverride]", _oc.read_outlier_overrides(path)
+    )
+
+
+def load_protect_windows(
+    config_dir: Path,
+) -> dict[str, tuple[tuple[float, float], ...]]:
+    """Read the deployed per-station protect-window catalog.
+
+    The active-unrest intervals excluded from flagging — the deployed
+    ``protect_windows.csv``, read through the shared resolver (the SAME source
+    geo_dataread reads; design §2). Per-station (keyed by marker), unlike the
+    former yaml global list. A missing file returns an empty catalog.
+    """
+    path = config_dir / _oc.PROTECT_WINDOWS_FILENAME
+    if not path.is_file():
+        return {}
+    return cast(
+        "dict[str, tuple[tuple[float, float], ...]]",
+        _oc.read_protect_windows(path),
+    )
 
 
 #: Velocity estimators the precompute job implements (Amendment A5).

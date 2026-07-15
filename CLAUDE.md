@@ -102,10 +102,15 @@ Fixture `tests/fixtures/realdata/` is gitignored (`fetch` rebuilds);
 **Outlier detection** (2026-07-13, Amendment A8, `precompute/outliers.py`;
 full detail: contract A8 + `gps_analysis/docs/DESIGN_outlier_detection.md`
 §5/§9): gated by the `analysis.yaml` `outliers:` block (`OutlierConfig` —
-5/5/10 mm H/H/V floors + validated per-station `overrides`; CLI
-`--no-outliers`; absent block = off). Calls `gps_analysis.detect_outliers`
-(branch `outlier-detection-leaf`) with **step-augmented** inputs from the
-deployed `steps.csv` (`load_step_catalog`, `N|E|U|ALL` → per-component
+fleet-wide GLOBAL defaults only; CLI `--no-outliers`; absent block = off).
+**Per-station tuning is CSV, not yaml (2026-07-15, single-source refactor —
+`gps_parser/docs/DESIGN_shared_outlier_config.md`):** `steps.csv`,
+`outlier_overrides.csv` (levers + independent N/E/U floors), `protect_windows.csv`
+are read through the shared `gps_parser.outlier_catalogs` resolver — the SAME
+source geo_dataread's `_cleaned.NEU` path reads (cross-repo parity pinned by
+`tests/test_outlier_config_parity.py`). yaml `overrides:`/`protect_windows:` are
+DEPRECATED + IGNORED (job warns). Calls `gps_analysis.detect_outliers` with
+**step-augmented** inputs (`load_step_catalog`, `N|E|U|ALL` → per-component
 lists — the SENG lesson: a stepless model over-flags active stations).
 NON-destructive: raw parquet columns byte-identical; additive `*_outlier`
 / `*_outlier_reason` / `*_outlier_protected` / `outlier_epoch` columns +
