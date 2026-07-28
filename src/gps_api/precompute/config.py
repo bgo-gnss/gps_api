@@ -127,6 +127,7 @@ OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "run_sign_fraction",
         "step_evidence_sigma",
         "step_window_days",
+        "whiten_sigma_clip",
         "max_flag_fraction",
         "min_abort_candidates",
         "max_iterations",
@@ -185,6 +186,7 @@ class OutlierConfig:
     run_sign_fraction: float = 0.8
     step_evidence_sigma: float = 3.0
     step_window_days: float = 10.0
+    whiten_sigma_clip: float = 0.0
     max_flag_fraction: float = 0.05
     min_abort_candidates: int = 0
     max_iterations: int = 3
@@ -436,9 +438,7 @@ def load_outlier_overrides(config_dir: Path) -> dict[str, StationOutlierOverride
     path = config_dir / _oc.OUTLIER_OVERRIDES_FILENAME
     if not path.is_file():
         return {}
-    return cast(
-        "dict[str, StationOutlierOverride]", _oc.read_outlier_overrides(path)
-    )
+    return cast("dict[str, StationOutlierOverride]", _oc.read_outlier_overrides(path))
 
 
 def load_protect_windows(
