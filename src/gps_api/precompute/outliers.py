@@ -149,6 +149,11 @@ class StationOutliers:
     aborted: bool
     converged: bool
     n_iterations: int
+    #: Per-component abort mask (§3.5a). ``aborted`` stays
+    #: ``any(component_aborted)`` so existing readers are unaffected;
+    #: this says WHICH, so a partial abort is distinguishable from a
+    #: total one -- the first still cleans its healthy components.
+    component_aborted: tuple[bool, ...] = (False, False, False)
 
     @property
     def union_flags(self) -> NDArray[np.bool_]:
@@ -316,6 +321,19 @@ def _normalize_events(
     ]
 
 
+def _component_aborted(detection: Any, n_components: int) -> tuple[bool, ...]:
+    """Per-component abort mask from a leaf result (§3.5a).
+
+    Read with the codebase's degrade idiom so an older ``gps_analysis``
+    exposing only the scalar ``excess_flag_abort`` still works -- there the
+    scalar is broadcast, reproducing the pre-2026-07-28 whole-station meaning.
+    """
+    mask = getattr(detection, "component_abort", None)
+    if mask is None or np.size(mask) != n_components:
+        return (bool(detection.excess_flag_abort),) * n_components
+    return tuple(bool(v) for v in np.atleast_1d(mask))
+
+
 def detect_station_outliers(
     series: StationSeries,
     model: Any,
@@ -383,6 +401,7 @@ def detect_station_outliers(
             aborted=detection.excess_flag_abort,
             converged=detection.converged,
             n_iterations=detection.n_iterations,
+            component_aborted=_component_aborted(detection, len(COMPONENTS)),
         )
 
     # Component-specific step catalogs: per-component leaf calls, then the
@@ -395,6 +414,7 @@ def detect_station_outliers(
     detrended = np.zeros((len(COMPONENTS), n), dtype=np.float64)
     events: list[SuspectedStep] = []
     aborted = False
+    comp_abort = [False] * len(COMPONENTS)
     converged = True
     n_iterations = 0
     for i, component in enumerate(COMPONENTS):
@@ -420,16 +440,24 @@ def detect_station_outliers(
             dtype=np.float64,
         )
         events.extend(_normalize_events(detection, series.marker, {0: component}))
-        aborted = aborted or detection.excess_flag_abort
+        comp_abort[i] = bool(detection.excess_flag_abort)
+        aborted = aborted or comp_abort[i]
         converged = converged and detection.converged
         n_iterations = max(n_iterations, detection.n_iterations)
     if aborted:
-        # Whole-station abort, matching the leaf's single-call semantics
-        # (any component over the candidate fraction ⇒ all flags all-False).
-        flags[:] = False
-        converged = False
-    elif params.epoch_policy == "union":
-        flags[:] = flags.any(axis=0)[np.newaxis, :]
+        # §3.5a: zero ONLY the aborting components. Zeroing the station
+        # because one component has an unmodeled-signal problem discards
+        # perfectly good cleaning from its siblings (SAUD: candidate
+        # fractions [0.100, 0.009, 0.006] -- only north is pathological).
+        for i, bad in enumerate(comp_abort):
+            if bad:
+                flags[i] = False
+        converged = converged and not all(comp_abort)
+    if params.epoch_policy == "union" and not all(comp_abort):
+        live = [i for i, bad in enumerate(comp_abort) if not bad]
+        union = flags[live].any(axis=0)
+        for i in live:
+            flags[i] = union
     return StationOutliers(
         marker=series.marker,
         flags=flags,
@@ -444,6 +472,7 @@ def detect_station_outliers(
         aborted=aborted,
         converged=converged,
         n_iterations=n_iterations,
+        component_aborted=tuple(comp_abort),
     )
 
 

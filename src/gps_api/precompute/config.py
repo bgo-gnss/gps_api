@@ -128,6 +128,7 @@ OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "step_evidence_sigma",
         "step_window_days",
         "max_flag_fraction",
+        "min_abort_candidates",
         "max_iterations",
         "epoch_policy",
     }
@@ -185,6 +186,7 @@ class OutlierConfig:
     step_evidence_sigma: float = 3.0
     step_window_days: float = 10.0
     max_flag_fraction: float = 0.05
+    min_abort_candidates: int = 0
     max_iterations: int = 3
     epoch_policy: str = "per_component"
     protect_windows: tuple[tuple[float, float], ...] = ()

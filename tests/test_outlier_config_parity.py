@@ -88,3 +88,63 @@ def test_nondefault_global_is_a_known_divergence(tmp_path):
     assert api_params.window_n_sigma == 3.5
     assert geo.params.window_n_sigma == 4.0  # geo_dataread never saw the yaml
     assert api_params != geo.params  # globals diverge — the documented limit
+
+
+def test_outlier_field_parity_across_mirrors() -> None:
+    """Every catalog/config key must name a real ``OutlierParams`` field.
+
+    ``OutlierParams``' field list is mirrored in FOUR places (backlog #10):
+    ``gps_parser.outlier_catalogs.OUTLIER_OVERRIDE_COLUMNS``, this package's
+    ``OutlierConfig`` + its global key set, and the deployed
+    ``analysis.yaml`` template. Nothing forced them to agree, so a leaf field
+    added in one place and forgotten in another failed SILENTLY — the column
+    parses, the value is dropped, and the station is tuned with a knob that
+    does nothing.
+
+    This pins the direction that actually bites: a mirror key that is NOT a
+    leaf field. The reverse (a leaf field with no config route) is expected —
+    only 6 of 27 are per-station tunable by design.
+    """
+    import dataclasses
+
+    from gps_analysis import OutlierParams
+
+    leaf = {f.name for f in dataclasses.fields(OutlierParams)}
+
+    # per-station CSV columns (minus the non-parameter bookkeeping ones)
+    csv_cols = set(oc.OUTLIER_OVERRIDE_COLUMNS) - {"sta", "comment"}
+    csv_params = {c for c in csv_cols if not c.startswith("min_outlier_")}
+    assert csv_params <= leaf, (
+        f"outlier_overrides.csv columns naming no OutlierParams field: "
+        f"{sorted(csv_params - leaf)}"
+    )
+
+    # gps_api's fleet-wide global key set
+    globals_ = (
+        set(OutlierConfig.GLOBAL_KEYS)
+        if hasattr(OutlierConfig, "GLOBAL_KEYS")
+        else None
+    )
+    if globals_ is not None:
+        assert globals_ <= leaf, (
+            f"analysis.yaml global keys naming no OutlierParams field: "
+            f"{sorted(globals_ - leaf)}"
+        )
+
+
+def test_min_abort_candidates_reaches_the_leaf_from_a_station_row(tmp_path) -> None:
+    """A declared column must actually change detection, not just parse.
+
+    §3.5a's floor is useless if the CSV accepts it and the resolver drops it
+    on the floor — which is exactly what happened when the column was added
+    to OUTLIER_OVERRIDE_COLUMNS before the parser knew about it.
+    """
+    csv = tmp_path / "outlier_overrides.csv"
+    csv.write_text(
+        "sta,despike,window_order,window_robust_iterations,epoch_policy,"
+        "despike_n_sigma,min_abort_candidates,min_outlier_n,min_outlier_e,"
+        "min_outlier_u,comment\n"
+        "TEST,,,,,,10,,,,§3.5a small-N floor\n"
+    )
+    resolved = resolve_outlier_detection("TEST", outlier_overrides=str(csv))
+    assert resolved.params.min_abort_candidates == 10
