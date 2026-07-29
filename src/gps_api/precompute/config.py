@@ -127,6 +127,9 @@ OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "run_sign_fraction",
         "step_evidence_sigma",
         "step_window_days",
+        "enable_global",
+        "enable_window",
+        "enable_protection",
         "whiten_sigma_clip",
         "max_flag_fraction",
         "min_abort_candidates",
@@ -186,6 +189,9 @@ class OutlierConfig:
     run_sign_fraction: float = 0.8
     step_evidence_sigma: float = 3.0
     step_window_days: float = 10.0
+    enable_global: bool = True
+    enable_window: bool = True
+    enable_protection: bool = True
     whiten_sigma_clip: float = 0.0
     max_flag_fraction: float = 0.05
     min_abort_candidates: int = 0
