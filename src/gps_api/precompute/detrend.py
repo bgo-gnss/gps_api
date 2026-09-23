@@ -22,9 +22,10 @@ the precompute job produce that document (``DESIGN_live_detrending.md``
   ``detrend_method`` = ``"step_augmented_robust"`` (outlier stage on, the
   default) vs ``"plain_wls"``; this stage carries it through untouched.
 - **UseSTA borrowing (decision 6):** the config's borrower → donor map is
-  resolved here into SELF-CONTAINED borrower records (donor's coefficients
-  copied, ``borrowed`` provenance set) — the apply path never chases donor
-  references.
+  resolved here into SELF-CONTAINED borrower records — the donor's rate and
+  seasonal, re-anchored at the borrower's own datum with the donor's steps
+  dropped (:func:`gps_analysis.reanchor_record`), ``borrowed`` provenance
+  set — the apply path never chases donor references.
 - **Pinning (decision 7):** a pinned station's record is honored verbatim
   (validated, never refit, never overwritten by a fresh fit).
 - **Graceful, loud (decision 4):** a failed validity gate means NO record
@@ -38,7 +39,6 @@ the precompute job produce that document (``DESIGN_live_detrending.md``
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import datetime
 import json
@@ -49,7 +49,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from gps_analysis import OutlierParams, estimate_detrend, trajectory_from_record
+from gps_analysis import (
+    OutlierParams,
+    estimate_detrend,
+    reanchor_record,
+    trajectory_from_record,
+)
 
 from gps_api import settings
 from gps_api.precompute.config import (
@@ -158,19 +163,47 @@ def _pinned_record(
     return dict(record)
 
 
-def _borrowed_record(donor_record: dict[str, Any], donor: str) -> dict[str, Any]:
+def _borrowed_record(
+    donor_record: dict[str, Any],
+    donor: str,
+    series: StationSeries,
+    window: tuple[float | None, float | None],
+) -> dict[str, Any]:
     """Self-contained borrower record from a donor's record (decision 6).
 
-    The donor's coefficients are copied verbatim (a stored record applies
-    cleanly to ANY station's epochs — design §2.6); only the ``borrowed``
-    provenance slot changes, in exactly the shape the reader surfaces
-    (``geo_dataread.gps_views`` reads ``record.get("borrowed")``).
+    The donor's rate and seasonal transfer; its DATUM and its STEPS do not.
+    The stored ``offset`` is the intercept at t = 0 in absolute fractional
+    years, so a verbatim copy pinned the borrower to the donor's level
+    (measured on SENG←SKSH: (−2.9, −30.1, +41.5) mm N/E/U), and the donor's
+    ``step_epochs`` subtracted the DONOR's equipment steps from the borrower.
+    :func:`gps_analysis.reanchor_record` drops the steps and re-anchors the
+    datum on the borrower's own series over its configured fit window, so
+    the record stays self-contained (the apply path never chases donor
+    references) and is correct for THIS station.
+
+    The ``borrowed`` slot records what was done: donor, vintage, the anchor
+    window, the per-component datum and any dropped donor step epochs —
+    distinguishable from the verbatim copies written before 2026-09-23.
+
+    Raises:
+        ValueError: From :func:`gps_analysis.reanchor_record` — a donor
+            record without ``param_names``, or a window selecting no
+            finite borrower epoch. The caller skips the borrower loudly;
+            there is no fallback to the donor's level.
     """
-    record = copy.deepcopy(donor_record)
+    lo, hi = window
+    anchor_window = (
+        float(series.t[0]) if lo is None else float(lo),
+        float(series.t[-1]) if hi is None else float(hi),
+    )
+    record, anchor = reanchor_record(
+        donor_record, series.t, series.y, series.sigma, window=anchor_window
+    )
     record["borrowed"] = {
         "from": donor,
         "terms": "all",
         "donor_fitted_at": donor_record.get("fitted_at"),
+        "anchor": anchor,
     }
     return record
 
@@ -419,10 +452,41 @@ def run_detrend_estimation(
                 flush=True,
             )
             continue
-        records[borrower] = _borrowed_record(donor_record, donor)
+        series = series_map.get(borrower)
+        if series is None:
+            skipped[borrower] = (
+                f"use_sta borrow from {donor!r} needs {borrower}'s own series "
+                "to anchor the donor's background at this station's level; "
+                "no series available this run"
+            )
+            print(
+                f"[{borrower}] detrend params: {skipped[borrower]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        try:
+            records[borrower] = _borrowed_record(
+                donor_record,
+                donor,
+                series,
+                dcfg.window_for(borrower, float(series.t[-1])),
+            )
+        except ValueError as exc:
+            skipped[borrower] = f"use_sta borrow from {donor!r} not anchored: {exc}"
+            print(
+                f"[{borrower}] detrend params: {skipped[borrower]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         borrowed[borrower] = donor
+        datum = ", ".join(
+            f"{v:+.1f}" for v in records[borrower]["borrowed"]["anchor"]["datum"]
+        )
         print(
-            f"[{borrower}] detrend params: borrowed from {donor} (UseSTA)",
+            f"[{borrower}] detrend params: borrowed from {donor} (UseSTA), "
+            f"re-anchored datum [{datum}] mm",
             flush=True,
         )
 
