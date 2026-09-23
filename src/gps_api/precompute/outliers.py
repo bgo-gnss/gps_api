@@ -4,7 +4,7 @@ Wires the ``gps_analysis.outliers`` leaf into the per-station chain,
 non-destructively: the leaf returns a MASK plus diagnostics — this module
 maps config → :class:`gps_analysis.OutlierParams`, builds the
 **step-augmented** model inputs from the deployed per-station step catalog
-(``steps.csv`` — TOS equipment changes + skjálftalísa coseismic offsets),
+(``steps.yaml`` — TOS equipment changes + skjálftalísa coseismic offsets),
 and packages the result for the writers. The raw series is never touched;
 flags ride as additive Parquet columns (:mod:`gps_api.precompute.products`).
 
@@ -36,7 +36,7 @@ from gps_analysis import (
     remove_trend,
     with_steps,
 )
-from gps_parser.outlier_catalogs import StationOutlierOverride
+from gps_parser.outlier_catalogs import StationOutlierOverride, match_declared_epochs
 from numpy.typing import NDArray
 
 from gps_api.precompute.config import OUTLIER_OVERRIDE_KEYS, OutlierConfig, StepRecord
@@ -75,7 +75,7 @@ class SuspectedStep:
     The precompute-side view of :class:`gps_analysis.SuspectedEvent`:
     component index resolved to its name, epochs carried both as
     fractional years and UTC timestamps. These rows become
-    ``meta/suspected_steps.csv`` — candidate ``steps.csv`` entries and
+    ``meta/suspected_steps.csv`` — candidate ``steps.yaml`` entries and
     suspected-icing/transient hints for visual assessment (BGÓ Q5).
     """
 
@@ -342,6 +342,7 @@ def detect_station_outliers(
     *,
     override: StationOutlierOverride | None = None,
     protect_windows: tuple[tuple[float, float], ...] = (),
+    excluded_epochs: tuple[float, ...] = (),
 ) -> StationOutliers:
     """Run the leaf detection for one station with its step catalog.
 
@@ -369,6 +370,10 @@ def detect_station_outliers(
     floors_arr = np.asarray(floors, dtype=np.float64)
     component_of = dict(enumerate(COMPONENTS))
 
+    # Operator-declared manual removals: match the declared epochs to series
+    # indices once, OR them into the flags in BOTH paths below.
+    manual_idx = match_declared_epochs(series.t, excluded_epochs)
+
     if len(set(step_lists)) == 1:
         epochs = np.asarray(step_lists[0], dtype=np.float64)
         detection = detect_outliers(
@@ -387,9 +392,12 @@ def detect_station_outliers(
             remove_trend(fit_model, series.t, series.y, detection.fits),
             dtype=np.float64,
         )
+        flags_arr = detection.flags.copy()
+        if manual_idx:
+            flags_arr[:, list(manual_idx)] = True
         return StationOutliers(
             marker=series.marker,
-            flags=detection.flags.copy(),
+            flags=flags_arr,
             candidates=detection.candidates.copy(),
             reasons=detection.reasons.copy(),
             protected=detection.protected.copy(),
@@ -458,6 +466,8 @@ def detect_station_outliers(
         union = flags[live].any(axis=0)
         for i in live:
             flags[i] = union
+    if manual_idx:
+        flags[:, list(manual_idx)] = True
     return StationOutliers(
         marker=series.marker,
         flags=flags,

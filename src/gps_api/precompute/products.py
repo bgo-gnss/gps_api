@@ -199,7 +199,7 @@ def write_suspected_steps_csv(store: Path, rows: list[dict[str, Any]]) -> Path:
 
     ``meta/suspected_steps.csv`` — the protected ``SuspectedEvent``
     clusters of every station the outlier stage processed, as candidate
-    ``steps.csv`` entries / suspected-icing hints for visual assessment.
+    ``steps.yaml`` entries / suspected-icing hints for visual assessment.
     Written whenever the stage ran (header-only when nothing was
     protected, so "empty file" reads as "stage ran, nothing suspected",
     never as "stage skipped").

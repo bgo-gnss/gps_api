@@ -33,7 +33,7 @@ PARAMS_DIR = "params"
 STATIONS_FILE = "stations.geojson"
 RUN_META_FILE = "run.json"
 #: Operator-review deliverable of the outlier stage (design §5.1 / BGÓ Q5):
-#: protected SuspectedEvent clusters as candidate steps.csv entries.
+#: protected SuspectedEvent clusters as candidate steps.yaml entries.
 SUSPECTED_STEPS_FILE = "suspected_steps.csv"
 #: Stored detrend-parameter document (DESIGN_live_detrending §3) — the
 #: candidate the estimation stage writes under ``params/``; the DEPLOYED

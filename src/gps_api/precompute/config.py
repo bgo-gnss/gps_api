@@ -415,7 +415,7 @@ class DetrendConfig:
 
 
 def load_step_catalog(config_dir: Path) -> dict[str, tuple[StepRecord, ...]]:
-    """Read the deployed per-station step catalog (``<gpsconfig>/steps.csv``).
+    """Read the deployed per-station step catalog (``<gpsconfig>/steps.yaml``).
 
     Delegates parsing to :func:`gps_parser.outlier_catalogs.read_steps` (the
     single source geo_dataread's ``_cleaned.NEU`` path reads too — no second
@@ -426,8 +426,8 @@ def load_step_catalog(config_dir: Path) -> dict[str, tuple[StepRecord, ...]]:
         ValueError: On a malformed row (bad epoch, unknown component tag) —
             a corrupt catalog must fail the run, not silently drop steps.
     """
-    path = config_dir / _oc.STEPS_FILENAME
-    if not path.is_file():
+    path = _oc.resolve_steps_path(config_dir / _oc.STEPS_FILENAME)
+    if path is None or not path.is_file():
         return {}
     return cast("dict[str, tuple[StepRecord, ...]]", _oc.read_steps(path))
 
@@ -464,6 +464,20 @@ def load_protect_windows(
         "dict[str, tuple[tuple[float, float], ...]]",
         _oc.read_protect_windows(path),
     )
+
+
+def load_excluded_epochs(config_dir: Path) -> dict[str, tuple[float, ...]]:
+    """Read the deployed per-station manual-epoch-exclusion catalog.
+
+    The operator-declared blunder epochs force-flagged in every component —
+    the deployed ``excluded_epochs.csv``, read through the shared resolver
+    (the SAME source geo_dataread's ``_cleaned.NEU`` path reads; design §2).
+    A missing file returns an empty catalog (no manual exclusions).
+    """
+    path = config_dir / _oc.EXCLUDED_EPOCHS_FILENAME
+    if not path.is_file():
+        return {}
+    return cast("dict[str, tuple[float, ...]]", _oc.read_excluded_epochs(path))
 
 
 #: Velocity estimators the precompute job implements (Amendment A5).

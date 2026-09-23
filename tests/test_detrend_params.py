@@ -118,9 +118,14 @@ breakpoints:
   t_runs: 20
 """
 
-STEPS_CSV = (
-    "sta,epoch_yearf,component,kind,source,comment\n"
-    f"SENG,{STEP_EPOCH},ALL,equipment,manual,test antenna swap\n"
+STEPS_YAML = (
+    "schema_version: 1\n"
+    "stations:\n"
+    "  SENG:\n"
+    f"    - epoch_yearf: {STEP_EPOCH}\n"
+    "      kind: equipment\n"
+    "      source: manual\n"
+    "      comment: test antenna swap\n"
 )
 
 
@@ -180,7 +185,7 @@ def env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     (config_dir / "stations.cfg").write_text(STATIONS_CFG)
     (config_dir / "postprocess.cfg").write_text(POSTPROCESS_CFG)
     (config_dir / "analysis.yaml").write_text(ANALYSIS_YAML)
-    (config_dir / "steps.csv").write_text(STEPS_CSV)
+    (config_dir / "steps.yaml").write_text(STEPS_YAML)
     store = tmp_path_factory.mktemp("store")
     sentinel = _sentinel_record()
     params_dir = store / "params"
