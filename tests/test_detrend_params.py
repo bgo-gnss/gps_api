@@ -363,16 +363,13 @@ def test_borrowed_record_is_self_contained_with_provenance(
 ) -> None:
     seng = run["doc"]["stations"]["SENG"]
     eldc = run["doc"]["stations"]["ELDC"]
-    assert eldc["borrowed"] == {
-        "from": "SENG",
-        "terms": "all",
-        "donor_fitted_at": seng["fitted_at"],
-    }
-    # Everything else is the donor's record, copied (self-contained: the
-    # apply path never chases donor references — design §2.6).
-    assert {k: v for k, v in eldc.items() if k != "borrowed"} == {
-        k: v for k, v in seng.items() if k != "borrowed"
-    }
+    borrowed = eldc["borrowed"]
+    assert borrowed["from"] == "SENG"
+    assert borrowed["terms"] == "all"
+    assert borrowed["donor_fitted_at"] == seng["fitted_at"]
+    # The anchor provenance says what was done at THIS station.
+    assert borrowed["anchor"]["dropped_step_epochs"] == [STEP_EPOCH]
+    assert len(borrowed["anchor"]["datum"]) == 3
     # The reader surfaces the borrowed provenance on the applied view.
     series = _clean_series("ELDC")
     _, provenance = gps_views.detrend_arrays(
@@ -380,6 +377,96 @@ def test_borrowed_record_is_self_contained_with_provenance(
     )
     assert provenance["applied"] is True
     assert provenance["borrowed"]["from"] == "SENG"
+
+
+def test_borrowed_record_keeps_the_donors_rate_and_seasonal(
+    run: dict[str, Any],
+) -> None:
+    """Only the datum and the donor's steps change; the rest is the donor's."""
+    seng = run["doc"]["stations"]["SENG"]
+    eldc = run["doc"]["stations"]["ELDC"]
+    assert eldc["step_epochs"] == []
+    assert eldc["param_names"] == [
+        n for n in seng["param_names"] if not n.startswith("step_amp_")
+    ]
+    for donor_c, borrow_c in zip(seng["components"], eldc["components"], strict=True):
+        assert borrow_c["params"][1:] == donor_c["params"][1:6]
+
+
+def test_borrowed_record_fits_the_borrower_not_the_donor(
+    run: dict[str, Any],
+) -> None:
+    """The behaviour, not the report: applied to ELDC's OWN data the borrowed
+    background leaves a zero-mean residual on both sides of SENG's 30 mm
+    step epoch. The verbatim copy this replaces left ~−30 mm after it."""
+    series = _loader("ELDC")
+    resid = series.y - evaluate_record(run["doc"]["stations"]["ELDC"], series.t)
+    for part in (series.t < STEP_EPOCH, series.t >= STEP_EPOCH):
+        np.testing.assert_allclose(resid[:, part].mean(axis=1), 0.0, atol=0.3)
+
+
+def _borrow(
+    run: dict[str, Any], tmp_path: Path, series_map: dict[str, StationSeries]
+) -> Any:
+    return run_detrend_estimation(
+        cfg=dataclasses.replace(
+            run["cfg"], detrend_estimation=DetrendConfig(use_sta={"ELDC": "SENG"})
+        ),
+        region_name=REGION,
+        frame=FRAME,
+        stations=("SENG", "ELDC"),
+        series_map=series_map,
+        step_catalog={},
+        store=tmp_path / "store",
+        fitted_at=FITTED_AT,
+    )
+
+
+def test_borrow_anchors_a_borrower_at_a_different_datum(
+    run: dict[str, Any], tmp_path: Path
+) -> None:
+    """Donor datum != recipient datum — the case the verbatim copy got wrong
+    by exactly the shift (docs/REVIEW_2026-09-13_package.md meta-finding)."""
+    shift = np.array([[30.0], [-41.0], [17.0]])
+    eldc = _clean_series("ELDC")
+    eldc = dataclasses.replace(eldc, y=eldc.y + shift)
+    result = _borrow(run, tmp_path, {"SENG": _clean_series("SENG"), "ELDC": eldc})
+    assert result.borrowed == {"ELDC": "SENG"}
+    record = result.records["ELDC"]
+    resid = eldc.y - evaluate_record(record, eldc.t)
+    np.testing.assert_allclose(resid.mean(axis=1), 0.0, atol=0.3)
+    verbatim = eldc.y - evaluate_record(result.records["SENG"], eldc.t)
+    np.testing.assert_allclose(verbatim.mean(axis=1), shift.ravel(), atol=0.5)
+
+
+def test_borrow_without_the_borrowers_series_is_skipped_loudly(
+    run: dict[str, Any], tmp_path: Path
+) -> None:
+    result = _borrow(run, tmp_path, {"SENG": _clean_series("SENG")})
+    assert "ELDC" not in result.records
+    assert "anchor" in result.skipped["ELDC"]
+
+
+def test_borrow_with_an_empty_anchor_window_is_skipped_loudly(
+    run: dict[str, Any], tmp_path: Path
+) -> None:
+    result = run_detrend_estimation(
+        cfg=dataclasses.replace(
+            run["cfg"],
+            detrend_estimation=DetrendConfig(
+                use_sta={"ELDC": "SENG"}, fit_windows={"ELDC": (1990.0, 1991.0)}
+            ),
+        ),
+        region_name=REGION,
+        frame=FRAME,
+        stations=("SENG", "ELDC"),
+        series_map={m: _clean_series(m) for m in ("SENG", "ELDC")},
+        step_catalog={},
+        store=tmp_path / "store",
+        fitted_at=FITTED_AT,
+    )
+    assert "ELDC" not in result.records
+    assert "not anchored" in result.skipped["ELDC"]
 
 
 # ---------------------------------------------------------------------------
