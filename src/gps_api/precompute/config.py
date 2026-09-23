@@ -127,7 +127,12 @@ OUTLIER_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "run_sign_fraction",
         "step_evidence_sigma",
         "step_window_days",
+        "enable_global",
+        "enable_window",
+        "enable_protection",
+        "whiten_sigma_clip",
         "max_flag_fraction",
+        "min_abort_candidates",
         "max_iterations",
         "epoch_policy",
     }
@@ -184,7 +189,12 @@ class OutlierConfig:
     run_sign_fraction: float = 0.8
     step_evidence_sigma: float = 3.0
     step_window_days: float = 10.0
+    enable_global: bool = True
+    enable_window: bool = True
+    enable_protection: bool = True
+    whiten_sigma_clip: float = 0.0
     max_flag_fraction: float = 0.05
+    min_abort_candidates: int = 0
     max_iterations: int = 3
     epoch_policy: str = "per_component"
     protect_windows: tuple[tuple[float, float], ...] = ()
@@ -405,7 +415,7 @@ class DetrendConfig:
 
 
 def load_step_catalog(config_dir: Path) -> dict[str, tuple[StepRecord, ...]]:
-    """Read the deployed per-station step catalog (``<gpsconfig>/steps.csv``).
+    """Read the deployed per-station step catalog (``<gpsconfig>/steps.yaml``).
 
     Delegates parsing to :func:`gps_parser.outlier_catalogs.read_steps` (the
     single source geo_dataread's ``_cleaned.NEU`` path reads too — no second
@@ -416,8 +426,8 @@ def load_step_catalog(config_dir: Path) -> dict[str, tuple[StepRecord, ...]]:
         ValueError: On a malformed row (bad epoch, unknown component tag) —
             a corrupt catalog must fail the run, not silently drop steps.
     """
-    path = config_dir / _oc.STEPS_FILENAME
-    if not path.is_file():
+    path = _oc.resolve_steps_path(config_dir / _oc.STEPS_FILENAME)
+    if path is None or not path.is_file():
         return {}
     return cast("dict[str, tuple[StepRecord, ...]]", _oc.read_steps(path))
 
@@ -434,9 +444,7 @@ def load_outlier_overrides(config_dir: Path) -> dict[str, StationOutlierOverride
     path = config_dir / _oc.OUTLIER_OVERRIDES_FILENAME
     if not path.is_file():
         return {}
-    return cast(
-        "dict[str, StationOutlierOverride]", _oc.read_outlier_overrides(path)
-    )
+    return cast("dict[str, StationOutlierOverride]", _oc.read_outlier_overrides(path))
 
 
 def load_protect_windows(
@@ -456,6 +464,20 @@ def load_protect_windows(
         "dict[str, tuple[tuple[float, float], ...]]",
         _oc.read_protect_windows(path),
     )
+
+
+def load_excluded_epochs(config_dir: Path) -> dict[str, tuple[float, ...]]:
+    """Read the deployed per-station manual-epoch-exclusion catalog.
+
+    The operator-declared blunder epochs force-flagged in every component —
+    the deployed ``excluded_epochs.csv``, read through the shared resolver
+    (the SAME source geo_dataread's ``_cleaned.NEU`` path reads; design §2).
+    A missing file returns an empty catalog (no manual exclusions).
+    """
+    path = config_dir / _oc.EXCLUDED_EPOCHS_FILENAME
+    if not path.is_file():
+        return {}
+    return cast("dict[str, tuple[float, ...]]", _oc.read_excluded_epochs(path))
 
 
 #: Velocity estimators the precompute job implements (Amendment A5).

@@ -288,12 +288,18 @@ precompute = [
 name = "gps-parser"
 version = "0.4.0"
 source = { editable = "../gps_parser" }
+dependencies = [
+    { name = "gtimes" },
+    { name = "pyyaml" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
+    { name = "gtimes", specifier = ">=0.5.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
 ]
 provides-extras = ["dev"]

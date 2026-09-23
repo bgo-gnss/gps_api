@@ -128,10 +128,15 @@ outliers:
     vertical: 10.0
 """
 
-STEPS_CSV = f"""\
-# steps.csv test fixture — SENG's step is DECLARED; VONC's is not.
-sta,epoch_yearf,component,kind,source,comment
-SENG,{SENG_STEP_YEARF:.6f},ALL,equipment,manual,test antenna swap
+STEPS_YAML = f"""\
+# steps.yaml test fixture — SENG's step is DECLARED; VONC's is not.
+schema_version: 1
+stations:
+  SENG:
+    - epoch_yearf: {SENG_STEP_YEARF:.6f}
+      kind: equipment
+      source: manual
+      comment: test antenna swap
 """
 
 # Per-station tuning now lives in the deployed CSV (design §2 authority split),
@@ -188,7 +193,7 @@ def config_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     (config_dir / "stations.cfg").write_text(STATIONS_CFG)
     (config_dir / "postprocess.cfg").write_text(POSTPROCESS_CFG)
     (config_dir / "analysis.yaml").write_text(ANALYSIS_YAML)
-    (config_dir / "steps.csv").write_text(STEPS_CSV)
+    (config_dir / "steps.yaml").write_text(STEPS_YAML)
     (config_dir / "outlier_overrides.csv").write_text(OUTLIER_OVERRIDES_CSV)
     return config_dir
 

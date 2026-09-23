@@ -47,7 +47,7 @@ rule):
    ``outliers.enabled`` (CLI ``--no-outliers``). Runs FIRST per station:
    flags ride as additive Parquet columns (raw columns byte-identical),
    the detrended columns become the residuals of the outlier-robust
-   step-augmented fit (``steps.csv`` known steps — the SENG lesson), all
+   step-augmented fit (``steps.yaml`` known steps — the SENG lesson), all
    downstream estimates (velocity, breaks, deformation) fit on the
    INLIERS, and the protected ``SuspectedEvent`` clusters are written to
    ``meta/suspected_steps.csv`` for operator review. Aborts/failures are
@@ -106,6 +106,7 @@ from gps_api.precompute.config import (
     DeformationConfig,
     StationMeta,
     load_analysis_config,
+    load_excluded_epochs,
     load_outlier_overrides,
     load_protect_windows,
     load_station_meta,
@@ -705,6 +706,7 @@ def run_precompute(
     # yaml carries only the fleet-wide globals).
     outlier_overrides = load_outlier_overrides(cfg.config_dir) if outliers_on else {}
     protect_windows = load_protect_windows(cfg.config_dir) if outliers_on else {}
+    excluded_epochs = load_excluded_epochs(cfg.config_dir) if outliers_on else {}
     if outliers_on and cfg.outliers.deprecated_per_station_keys():
         print(
             f"[region {region.name}] outliers: analysis.yaml carries "
@@ -719,7 +721,7 @@ def run_precompute(
         # The real-data finding (SENG): a stepless trajectory model
         # over-flags real signal on active stations — say so up front.
         print(
-            f"[region {region.name}] outliers: no steps.csv under "
+            f"[region {region.name}] outliers: no steps.yaml under "
             f"{cfg.config_dir} — detection runs without known-step terms "
             "(over-flagging risk on stations with equipment/coseismic steps)",
             file=sys.stderr,
@@ -801,6 +803,7 @@ def run_precompute(
                         step_catalog.get(marker, ()),
                         override=outlier_overrides.get(marker),
                         protect_windows=protect_windows.get(marker, ()),
+                        excluded_epochs=excluded_epochs.get(marker, ()),
                     )
                 except Exception as exc:  # noqa: BLE001 — station proceeds unmasked
                     outliers_failed[marker] = f"{type(exc).__name__}: {exc}"
@@ -1055,7 +1058,7 @@ def run_precompute(
 
     if outliers_on and write_meta:
         # Operator-review deliverable (design §5.1 / BGÓ Q5): the protected
-        # SuspectedEvent clusters as candidate steps.csv entries. Fleet
+        # SuspectedEvent clusters as candidate steps.yaml entries. Fleet
         # runs suppress this (write_meta=False) and write the aggregate.
         written.append(str(products.write_suspected_steps_csv(store, suspected_rows)))
 

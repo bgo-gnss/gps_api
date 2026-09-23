@@ -301,7 +301,7 @@ def run_detrend_estimation(
     run's records (fresh or pinned — a donor outside the region/run means
     the borrower is skipped loudly); everything else gets a fresh
     :func:`estimate_station_record` fit over the configured window with
-    the station's ``steps.csv`` epochs (union over components — the
+    the station's ``steps.yaml`` epochs (union over components — the
     leaf's step list is shared across components; an amplitude near zero
     is estimated for components a step does not affect).
 
